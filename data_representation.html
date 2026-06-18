@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GestureLSM — Data Representation &amp; Body Parts</title>
+<style>
+  :root {
+    --rot:    #14b8a6;  /* rotation */
+    --trans:  #f59e0b;  /* translation */
+    --expr:   #ec4899;  /* expression */
+    --upper:  #2563eb;
+    --lower:  #16a34a;
+    --hands:  #9333ea;
+    --face:   #ea580c;
+    --excl:   #94a3b8;
+    --bg:     #0f172a;
+    --panel:  #1e293b;
+    --panel2: #334155;
+    --text:   #e2e8f0;
+    --muted:  #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:0 0 60px; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); line-height:1.55; }
+  header { padding:32px 24px 24px; text-align:center; background:linear-gradient(180deg,#1e293b,#0f172a); border-bottom:1px solid var(--panel2); }
+  header h1 { margin:0 0 6px; font-size:26px; }
+  header p { margin:0; color:var(--muted); font-size:14px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:0 24px; }
+  h2 { font-size:19px; margin:36px 0 14px; border-left:4px solid #38bdf8; padding-left:10px; }
+  .panel { background:var(--panel); border:1px solid var(--panel2); border-radius:12px; padding:18px; }
+
+  /* data-type hero cards */
+  .types { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  @media (max-width:780px){ .types { grid-template-columns:1fr; } }
+  .tcard { border-radius:12px; padding:18px; background:var(--panel); border:1px solid var(--panel2); border-top:5px solid; position:relative; }
+  .tcard .ico { font-size:30px; line-height:1; }
+  .tcard h3 { margin:8px 0 2px; font-size:18px; }
+  .tcard .dims { font-size:13px; color:var(--muted); margin-bottom:8px; }
+  .tcard .big { font-size:30px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .tcard p { font-size:13px; margin:8px 0 0; color:#cbd5e1; }
+  .tcard .tag { display:inline-block; font-size:11px; font-weight:600; color:#fff; padding:2px 9px; border-radius:999px; margin-top:6px; }
+
+  /* proportion bar */
+  .dimbar { display:flex; width:100%; height:44px; border-radius:8px; overflow:hidden; border:1px solid var(--panel2); margin-top:6px; }
+  .dimseg { height:100%; display:flex; align-items:center; justify-content:center; color:#06231f; font-weight:700; font-size:12px; }
+  .axis { display:flex; justify-content:space-between; width:100%; margin-top:4px; font-size:11px; color:var(--muted); }
+
+  .grid { display:grid; grid-template-columns:420px 1fr; gap:24px; align-items:start; }
+  @media (max-width:880px){ .grid { grid-template-columns:1fr; } }
+  .legend { display:flex; flex-wrap:wrap; gap:14px; margin:14px 0 4px; font-size:13px; justify-content:center; }
+  .legend span { display:inline-flex; align-items:center; gap:7px; }
+  .swatch { width:14px; height:14px; border-radius:4px; display:inline-block; }
+
+  table { border-collapse:collapse; width:100%; font-size:13px; margin-top:6px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--panel2); }
+  th { color:var(--muted); font-weight:600; }
+  td.num { font-variant-numeric:tabular-nums; }
+  .pill { font-size:11px; padding:2px 9px; border-radius:999px; color:#fff; font-weight:600; display:inline-block; }
+  code { background:#0b1220; padding:1px 6px; border-radius:5px; font-size:12.5px; color:#7dd3fc; }
+  .note { font-size:13px; color:#cbd5e1; background:#0b1220; border-left:3px solid #f59e0b; padding:11px 14px; border-radius:6px; margin-top:14px; }
+  .note.key { border-left-color:#38bdf8; }
+  .pipeline { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px; }
+  .pipeline .box { background:#0b1220; border:1px solid var(--panel2); border-radius:8px; padding:8px 12px; text-align:center; }
+  .pipeline .arrow { color:#38bdf8; font-size:18px; }
+  small { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>GestureLSM — Data Representation</h1>
+  <p>What kind of data each dimension is &nbsp;•&nbsp; rotation · translation · expression</p>
+</header>
+
+<div class="wrap">
+
+  <h2>1. Three kinds of data</h2>
+  <p style="color:var(--muted);margin-top:0">Every frame is a 433-dim vector made of <b>three fundamentally different data types</b> — they are <u>not</u> all rotations:</p>
+  <div class="types">
+    <div class="tcard" style="border-top-color:var(--rot)">
+      <div class="ico">🔄</div>
+      <h3>Rotation</h3>
+      <div class="dims">joint orientations · <b>6D rotation</b></div>
+      <div class="big" style="color:var(--rot)">330</div>
+      <div class="dims">= 55 joints × 6</div>
+      <span class="tag" style="background:var(--rot)">indices 0–329</span>
+      <p>Local rotation of each SMPL-X joint relative to its parent. Stored as continuous 6D rotation (not Euler/axis-angle).</p>
+    </div>
+    <div class="tcard" style="border-top-color:var(--trans)">
+      <div class="ico">➡️</div>
+      <h3>Translation</h3>
+      <div class="dims">root global motion · <b>velocity</b></div>
+      <div class="big" style="color:var(--trans)">3</div>
+      <div class="dims">= Δx, Δz, height&nbsp;y</div>
+      <span class="tag" style="background:var(--trans)">indices 330–332</span>
+      <p>How the whole body moves through space (root trajectory). x/z are per-frame velocity, y is absolute height (<code>trans_v</code>).</p>
+    </div>
+    <div class="tcard" style="border-top-color:var(--expr)">
+      <div class="ico">😀</div>
+      <h3>Expression</h3>
+      <div class="dims">face · <b>blendshape weights</b></div>
+      <div class="big" style="color:var(--expr)">100</div>
+      <div class="dims">= FLAME expr. coeffs</div>
+      <span class="tag" style="background:var(--expr)">indices 333–432</span>
+      <p>Facial expression coefficients — weights over a learned face basis. Neither rotations nor positions.</p>
+    </div>
+  </div>
+
+  <div class="note key" style="margin-top:18px">
+    <b>Key point — there are NO 3D positions in the data.</b> Joints are stored as <b>rotations</b>, and the body as a whole as <b>translation</b>.
+    Actual 3D joint/vertex <b>positions</b> are computed only later by <b>forward kinematics</b> through the SMPL-X model
+    (rotations + translation + body shape → mesh). So the model learns angles &amp; motion, not coordinates.
+  </div>
+
+  <h2>2. Proportion of the 433-dim vector (by data type)</h2>
+  <div class="panel">
+    <div class="dimbar">
+      <div class="dimseg" style="background:var(--rot);width:76.2%">Rotation · 330</div>
+      <div class="dimseg" style="background:var(--trans);width:0.7%" title="Translation · 3"></div>
+      <div class="dimseg" style="background:var(--expr);width:23.1%;color:#2a0716">Expression · 100</div>
+    </div>
+    <div class="axis"><span>0</span><span>329 | 330–332</span><span>432</span></div>
+    <div class="legend" style="justify-content:flex-start">
+      <span><i class="swatch" style="background:var(--rot)"></i> Rotation (330)</span>
+      <span><i class="swatch" style="background:var(--trans)"></i> Translation (3)</span>
+      <span><i class="swatch" style="background:var(--expr)"></i> Expression (100)</span>
+    </div>
+  </div>
+
+  <h2>3. Body map — which joint, which part, which data type</h2>
+  <div class="grid">
+    <div class="panel" style="text-align:center">
+      <svg viewBox="0 0 400 600" width="400" height="600" style="width:100%;max-width:400px;height:auto" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="400" height="600" fill="#0b1220" rx="10"/>
+<line x1="176" y1="338" x2="200" y2="330" stroke="#475569" stroke-width="2"/>
+<line x1="224" y1="338" x2="200" y2="330" stroke="#475569" stroke-width="2"/>
+<line x1="200" y1="292" x2="200" y2="330" stroke="#475569" stroke-width="2"/>
+<line x1="172" y1="420" x2="176" y2="338" stroke="#475569" stroke-width="2"/>
+<line x1="228" y1="420" x2="224" y2="338" stroke="#475569" stroke-width="2"/>
+<line x1="200" y1="256" x2="200" y2="292" stroke="#475569" stroke-width="2"/>
+<line x1="170" y1="500" x2="172" y2="420" stroke="#475569" stroke-width="2"/>
+<line x1="230" y1="500" x2="228" y2="420" stroke="#475569" stroke-width="2"/>
+<line x1="200" y1="220" x2="200" y2="256" stroke="#475569" stroke-width="2"/>
+<line x1="164" y1="524" x2="170" y2="500" stroke="#475569" stroke-width="2"/>
+<line x1="236" y1="524" x2="230" y2="500" stroke="#475569" stroke-width="2"/>
+<line x1="200" y1="150" x2="200" y2="220" stroke="#475569" stroke-width="2"/>
+<line x1="184" y1="178" x2="200" y2="220" stroke="#475569" stroke-width="2"/>
+<line x1="216" y1="178" x2="200" y2="220" stroke="#475569" stroke-width="2"/>
+<line x1="200" y1="108" x2="200" y2="150" stroke="#475569" stroke-width="2"/>
+<line x1="158" y1="176" x2="184" y2="178" stroke="#475569" stroke-width="2"/>
+<line x1="242" y1="176" x2="216" y2="178" stroke="#475569" stroke-width="2"/>
+<line x1="138" y1="238" x2="158" y2="176" stroke="#475569" stroke-width="2"/>
+<line x1="262" y1="238" x2="242" y2="176" stroke="#475569" stroke-width="2"/>
+<line x1="122" y1="296" x2="138" y2="238" stroke="#475569" stroke-width="2"/>
+<line x1="278" y1="296" x2="262" y2="238" stroke="#475569" stroke-width="2"/>
+<line x1="193" y1="96" x2="200" y2="108" stroke="#475569" stroke-width="2"/>
+<line x1="190" y1="102" x2="200" y2="108" stroke="#475569" stroke-width="2"/>
+<line x1="210" y1="102" x2="200" y2="108" stroke="#475569" stroke-width="2"/>
+<line x1="92" y1="312" x2="122" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="92" y1="324" x2="92" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="92" y1="336" x2="92" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="103" y1="312" x2="122" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="103" y1="324" x2="103" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="103" y1="336" x2="103" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="114" y1="312" x2="122" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="114" y1="324" x2="114" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="114" y1="336" x2="114" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="125" y1="312" x2="122" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="125" y1="324" x2="125" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="125" y1="336" x2="125" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="136" y1="312" x2="122" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="136" y1="324" x2="136" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="136" y1="336" x2="136" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="264" y1="312" x2="278" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="264" y1="324" x2="264" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="264" y1="336" x2="264" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="275" y1="312" x2="278" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="275" y1="324" x2="275" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="275" y1="336" x2="275" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="286" y1="312" x2="278" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="286" y1="324" x2="286" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="286" y1="336" x2="286" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="297" y1="312" x2="278" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="297" y1="324" x2="297" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="297" y1="336" x2="297" y2="324" stroke="#475569" stroke-width="2"/>
+<line x1="308" y1="312" x2="278" y2="296" stroke="#475569" stroke-width="2"/>
+<line x1="308" y1="324" x2="308" y2="312" stroke="#475569" stroke-width="2"/>
+<line x1="308" y1="336" x2="308" y2="324" stroke="#475569" stroke-width="2"/>
+<circle cx="200" cy="103" r="23" fill="none" stroke="#ea580c" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="228" y="74" fill="#ea580c" font-size="10">face → 100 expression</text>
+<circle cx="200" cy="330" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 0 · pelvis · lower · rotation (rot6d idx 0-5)</title></circle>
+<circle cx="176" cy="338" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 1 · left_hip · lower · rotation (rot6d idx 6-11)</title></circle>
+<circle cx="224" cy="338" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 2 · right_hip · lower · rotation (rot6d idx 12-17)</title></circle>
+<circle cx="200" cy="292" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 3 · spine1 · upper · rotation (rot6d idx 18-23)</title></circle>
+<circle cx="172" cy="420" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 4 · left_knee · lower · rotation (rot6d idx 24-29)</title></circle>
+<circle cx="228" cy="420" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 5 · right_knee · lower · rotation (rot6d idx 30-35)</title></circle>
+<circle cx="200" cy="256" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 6 · spine2 · upper · rotation (rot6d idx 36-41)</title></circle>
+<circle cx="170" cy="500" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 7 · left_ankle · lower · rotation (rot6d idx 42-47)</title></circle>
+<circle cx="230" cy="500" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 8 · right_ankle · lower · rotation (rot6d idx 48-53)</title></circle>
+<circle cx="200" cy="220" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 9 · spine3 · upper · rotation (rot6d idx 54-59)</title></circle>
+<circle cx="164" cy="524" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 10 · left_foot · lower · rotation (rot6d idx 60-65)</title></circle>
+<circle cx="236" cy="524" r="6" fill="#16a34a" stroke="#0f172a" stroke-width="1.5"><title>joint 11 · right_foot · lower · rotation (rot6d idx 66-71)</title></circle>
+<circle cx="200" cy="150" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 12 · neck · upper · rotation (rot6d idx 72-77)</title></circle>
+<circle cx="184" cy="178" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 13 · left_collar · upper · rotation (rot6d idx 78-83)</title></circle>
+<circle cx="216" cy="178" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 14 · right_collar · upper · rotation (rot6d idx 84-89)</title></circle>
+<circle cx="200" cy="108" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 15 · head · upper · rotation (rot6d idx 90-95)</title></circle>
+<circle cx="158" cy="176" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 16 · left_shoulder · upper · rotation (rot6d idx 96-101)</title></circle>
+<circle cx="242" cy="176" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 17 · right_shoulder · upper · rotation (rot6d idx 102-107)</title></circle>
+<circle cx="138" cy="238" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 18 · left_elbow · upper · rotation (rot6d idx 108-113)</title></circle>
+<circle cx="262" cy="238" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 19 · right_elbow · upper · rotation (rot6d idx 114-119)</title></circle>
+<circle cx="122" cy="296" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 20 · left_wrist · upper · rotation (rot6d idx 120-125)</title></circle>
+<circle cx="278" cy="296" r="6" fill="#2563eb" stroke="#0f172a" stroke-width="1.5"><title>joint 21 · right_wrist · upper · rotation (rot6d idx 126-131)</title></circle>
+<circle cx="193" cy="96" r="6" fill="#94a3b8" stroke="#0f172a" stroke-width="1.5"><title>joint 22 · jaw · excluded · not trained (rot6d idx 132-137)</title></circle>
+<circle cx="190" cy="102" r="6" fill="#94a3b8" stroke="#0f172a" stroke-width="1.5"><title>joint 23 · left_eye · excluded · not trained (rot6d idx 138-143)</title></circle>
+<circle cx="210" cy="102" r="6" fill="#94a3b8" stroke="#0f172a" stroke-width="1.5"><title>joint 24 · right_eye · excluded · not trained (rot6d idx 144-149)</title></circle>
+<circle cx="92" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 25 · left_index1 · hands · rotation (rot6d idx 150-155)</title></circle>
+<circle cx="92" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 26 · left_index2 · hands · rotation (rot6d idx 156-161)</title></circle>
+<circle cx="92" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 27 · left_index3 · hands · rotation (rot6d idx 162-167)</title></circle>
+<circle cx="103" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 28 · left_middle1 · hands · rotation (rot6d idx 168-173)</title></circle>
+<circle cx="103" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 29 · left_middle2 · hands · rotation (rot6d idx 174-179)</title></circle>
+<circle cx="103" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 30 · left_middle3 · hands · rotation (rot6d idx 180-185)</title></circle>
+<circle cx="114" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 31 · left_pinky1 · hands · rotation (rot6d idx 186-191)</title></circle>
+<circle cx="114" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 32 · left_pinky2 · hands · rotation (rot6d idx 192-197)</title></circle>
+<circle cx="114" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 33 · left_pinky3 · hands · rotation (rot6d idx 198-203)</title></circle>
+<circle cx="125" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 34 · left_ring1 · hands · rotation (rot6d idx 204-209)</title></circle>
+<circle cx="125" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 35 · left_ring2 · hands · rotation (rot6d idx 210-215)</title></circle>
+<circle cx="125" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 36 · left_ring3 · hands · rotation (rot6d idx 216-221)</title></circle>
+<circle cx="136" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 37 · left_thumb1 · hands · rotation (rot6d idx 222-227)</title></circle>
+<circle cx="136" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 38 · left_thumb2 · hands · rotation (rot6d idx 228-233)</title></circle>
+<circle cx="136" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 39 · left_thumb3 · hands · rotation (rot6d idx 234-239)</title></circle>
+<circle cx="264" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 40 · right_index1 · hands · rotation (rot6d idx 240-245)</title></circle>
+<circle cx="264" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 41 · right_index2 · hands · rotation (rot6d idx 246-251)</title></circle>
+<circle cx="264" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 42 · right_index3 · hands · rotation (rot6d idx 252-257)</title></circle>
+<circle cx="275" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 43 · right_middle1 · hands · rotation (rot6d idx 258-263)</title></circle>
+<circle cx="275" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 44 · right_middle2 · hands · rotation (rot6d idx 264-269)</title></circle>
+<circle cx="275" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 45 · right_middle3 · hands · rotation (rot6d idx 270-275)</title></circle>
+<circle cx="286" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 46 · right_pinky1 · hands · rotation (rot6d idx 276-281)</title></circle>
+<circle cx="286" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 47 · right_pinky2 · hands · rotation (rot6d idx 282-287)</title></circle>
+<circle cx="286" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 48 · right_pinky3 · hands · rotation (rot6d idx 288-293)</title></circle>
+<circle cx="297" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 49 · right_ring1 · hands · rotation (rot6d idx 294-299)</title></circle>
+<circle cx="297" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 50 · right_ring2 · hands · rotation (rot6d idx 300-305)</title></circle>
+<circle cx="297" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 51 · right_ring3 · hands · rotation (rot6d idx 306-311)</title></circle>
+<circle cx="308" cy="312" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 52 · right_thumb1 · hands · rotation (rot6d idx 312-317)</title></circle>
+<circle cx="308" cy="324" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 53 · right_thumb2 · hands · rotation (rot6d idx 318-323)</title></circle>
+<circle cx="308" cy="336" r="3" fill="#9333ea" stroke="#0f172a" stroke-width="1.5"><title>joint 54 · right_thumb3 · hands · rotation (rot6d idx 324-329)</title></circle>
+      </svg>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--upper)"></i> upper</span>
+        <span><i class="swatch" style="background:var(--lower)"></i> lower</span>
+        <span><i class="swatch" style="background:var(--hands)"></i> hands</span>
+        <span><i class="swatch" style="background:var(--excl)"></i> excluded</span>
+      </div>
+      <small>Hover any joint for its index, name &amp; data type.</small>
+    </div>
+
+    <div>
+      <p style="margin-top:0;color:var(--muted)">Each colored joint above is a <b style="color:var(--rot)">rotation</b> (6 dims). The four trainable parts group them, and two parts add the other data types:</p>
+      <table>
+        <tr><th>Body part</th><th>Data type(s)</th><th>Dims</th><th>Contents</th></tr>
+        <tr>
+          <td><span class="pill" style="background:var(--lower)">lower_trans</span></td>
+          <td><span class="pill" style="background:var(--rot)">rotation</span> <span class="pill" style="background:var(--trans)">translation</span></td>
+          <td class="num">57</td><td>9 joints × 6 (54) + 3 translation</td>
+        </tr>
+        <tr>
+          <td><span class="pill" style="background:var(--upper)">upper</span></td>
+          <td><span class="pill" style="background:var(--rot)">rotation</span></td>
+          <td class="num">78</td><td>13 joints × 6</td>
+        </tr>
+        <tr>
+          <td><span class="pill" style="background:var(--hands)">hands</span></td>
+          <td><span class="pill" style="background:var(--rot)">rotation</span></td>
+          <td class="num">180</td><td>30 finger joints × 6</td>
+        </tr>
+        <tr>
+          <td><span class="pill" style="background:var(--face)">face</span></td>
+          <td><span class="pill" style="background:var(--expr)">expression</span></td>
+          <td class="num">100</td><td>FLAME expression coefficients</td>
+        </tr>
+      </table>
+      <div class="note">
+        <b>Note:</b> joints <b>22 jaw, 23 left_eye, 24 right_eye</b> (gray) are <b>not trained</b> in any rotation part
+        (upper ends at joint 21, hands start at joint 25). Facial motion is captured by the <span style="color:var(--expr)">expression</span> data instead.
+      </div>
+    </div>
+  </div>
+
+  <h2>4. How rotations are stored — why 6D?</h2>
+  <div class="panel">
+    <p style="margin-top:0">Source SMPL-X <code>.npz</code> stores rotations as <b>axis-angle</b> (55×3). The loader (<code>dataloaders/mix_sep.py:278</code>) converts to continuous <b>6D rotation</b> — friendlier for neural nets (no gimbal-lock / wrap-around):</p>
+    <div class="pipeline">
+      <span class="box">axis-angle<br><small>55 × 3 = 165</small></span>
+      <span class="arrow">→</span>
+      <span class="box">rotation matrix<br><small><code>axis_angle_to_matrix</code></small></span>
+      <span class="arrow">→</span>
+      <span class="box">6D rotation<br><small>55 × 6 = 330</small></span>
+      <span class="arrow">→</span>
+      <span class="box">+ translation + face<br><small>= 433</small></span>
+      <span class="arrow">→</span>
+      <span class="box" style="border-color:#38bdf8">3D positions<br><small>via forward kinematics</small></span>
+    </div>
+    <p style="margin-bottom:0"><small>Normalization: <code>mean_std/beatx_2_330_*.npy</code> (rotation) &amp; <code>beatx_2_trans_*.npy</code> (translation). Source: <code>mix_sep.py __getitem__</code> lines 278–300, parts in <code>rvq_beatx_train.py</code> 175–258.</small></p>
+  </div>
+
+</div>
+</body>
+</html>

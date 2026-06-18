@@ -603,7 +603,6 @@ def render_one_sequence(
     import os
     import numpy as np 
     import torch
-    import moviepy.editor as mp
     import librosa
     
     model = smplx.create(model_folder, model_type=model_type,
@@ -691,7 +690,6 @@ def render_one_sequence_no_gt(
     import os
     import numpy as np 
     import torch
-    import moviepy.editor as mp
     import librosa
     
     model = smplx.create(model_folder, model_type=model_type,

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Ensure the conda env's libstdc++ (provides CXXABI_1.3.15, required by matplotlib)
+# is loaded before the older system/fbcode libstdc++.
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
 # Run lower_trans training
 python rvq_beatx_train.py --batch-size 256 --lr 2e-4 --total-iter 300000 --lr-scheduler 200000 --nb-code 1024 --width 512 --code-dim 128 --down-t 2 --depth 3 --dilation-growth-rate 3 --out-dir outputs/rvqvae_simple --vq-act relu --quantizer ema_reset --loss-vel 0.5 --recons-loss l1_smooth --exp-name RVQVAE --body_part lower_trans
 echo "Waiting for 10 seconds..."

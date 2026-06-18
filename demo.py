@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")  # use EGL for headless pyrender rendering
 import signal
 import time
 import csv
@@ -379,7 +380,7 @@ class BaseTrainer(object):
                 in_seed_tmp = last_sample[:, -self.args.pre_frames:, :]
 
             cond_ = {'y':{}}
-            cond_['y']['audio'] = in_audio_tmp
+            cond_['y']['audio_onset'] = in_audio_tmp
             cond_['y']['word'] = in_word_tmp
             cond_['y']['id'] = in_id_tmp
             cond_['y']['seed'] =in_seed_tmp

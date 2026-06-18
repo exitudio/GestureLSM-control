@@ -26,7 +26,7 @@ def convert_img_to_mp4(input_pattern, output_file, framerate=30):
         'ffmpeg',
         '-framerate', str(framerate),
         '-i', input_pattern,
-        '-c:v', 'libx264',
+        '-c:v', 'libopenh264',
         '-pix_fmt', 'yuv420p',
         output_file,
         '-y' 
