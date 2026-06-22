@@ -30,7 +30,7 @@ class CustomDataset(Dataset):
         
         self.audio_file_path = args.audio_file_path
         self.textgrid_file_path = args.textgrid_file_path
-        self.default_pose_file = "./demo/examples/2_scott_0_1_1.npz"
+        self.default_pose_file = getattr(args, "pose_file_path", None) or "./demo/examples/2_scott_0_1_1.npz"
         
         self.args = args
         self.loader_type = loader_type

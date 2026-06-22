@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>GestureLSM — generation vs ground truth</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fafafa; color: #222; }
+  body { display: flex; flex-direction: column; overflow: hidden; }
+  header { flex: 0 0 auto; padding: 8px 16px; border-bottom: 1px solid #ddd; background: #fff; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  header .legend { font-size: 12px; color: #555; margin-top: 2px; }
+
+  /* Drop zone */
+  #drop {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(250, 250, 250, 0.96); transition: background 0.15s; z-index: 100;
+    cursor: pointer; user-select: none;
+  }
+  #drop.dragging { background: #e3f2fd; }
+  #drop .inner { text-align: center; pointer-events: none; padding: 32px; }
+  #drop h2 { margin: 0 0 8px; font-size: 22px; }
+  #drop p { margin: 4px 0; color: #555; font-size: 14px; }
+  #drop code { background: #eee; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+  #drop button { margin-top: 16px; padding: 8px 24px; font-size: 14px; cursor: pointer; pointer-events: auto; }
+  #drop .err { color: #b00; margin-top: 12px; }
+
+  /* Viewer */
+  #viewer { display: none; flex: 1 1 auto; min-height: 0; flex-direction: column; }
+  #viewer.active { display: flex; }
+  #plot { flex: 1 1 auto; min-height: 0; }
+  #ctrl { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: #fff; border-top: 1px solid #ddd; }
+  #ctrl audio { flex: 1; min-width: 200px; }
+  #ctrl input[type=range] { flex: 2; }
+  #ctrl button { padding: 4px 12px; font-size: 13px; cursor: pointer; }
+  #ctrl .frame { font-variant-numeric: tabular-nums; font-size: 12px; color: #666; min-width: 110px; text-align: right; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GestureLSM — generation vs ground truth</h1>
+  <div class="legend">
+    <span style="color:royalblue">■</span> generation bones &nbsp;
+    <span style="color:crimson">●</span> generation joints &nbsp;
+    <span style="color:seagreen">■</span> ground-truth bones &nbsp;
+    <span style="color:darkorange">●</span> ground-truth joints
+  </div>
+</header>
+
+<!-- Drop zone -->
+<div id="drop">
+  <div class="inner">
+    <h2>Drag your output folder here</h2>
+    <p>…or drop <code>gen_position.npz</code>, <code>gt_position.npz</code>, and <code>speech.wav</code>.</p>
+    <p>(audio is optional — without it the slider still works.)</p>
+    <div style="display:flex; gap:8px; justify-content:center; margin-top:16px;">
+      <button id="pickFolder">Choose folder…</button>
+      <button id="pickFiles">Choose files…</button>
+    </div>
+    <input id="pickerFolder" type="file" webkitdirectory directory multiple style="display:none">
+    <input id="pickerFiles"  type="file" multiple accept=".npz,.wav,application/octet-stream" style="display:none">
+    <p style="font-size:12px; color:#777; margin-top:18px;">Tip: open this page in Chrome or Firefox — VSCode's Simple Browser blocks file:// drag-drop.</p>
+    <div class="err" id="err"></div>
+  </div>
+</div>
+
+<!-- Viewer (hidden until data is loaded) -->
+<div id="viewer">
+  <div id="plot"></div>
+  <div id="ctrl">
+    <button id="play">▶︎</button>
+    <button id="toggleGt" title="Show / hide ground truth">Hide GT</button>
+    <input id="slider" type="range" min="0" max="0" value="0" step="1" />
+    <span class="frame" id="frameLbl">frame 0 / 0</span>
+    <audio id="aud" preload="auto"></audio>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ===================================================================
+// Constants
+// ===================================================================
+const FPS = 30;
+// SMPLX 55-joint kinematic tree
+const PARENTS = [
+  -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19,
+  15, 15, 15,
+  20, 25, 26, 20, 28, 29, 20, 31, 32, 20, 34, 35, 20, 37, 38,
+  21, 40, 41, 21, 43, 44, 21, 46, 47, 21, 49, 50, 21, 52, 53,
+];
+
+// ===================================================================
+// NPY parser  (supports v1.0 / v2.0 / v3.0 headers, little-endian dtypes)
+// ===================================================================
+function parseNpy(bytes) {
+  // bytes is Uint8Array
+  if (bytes[0] !== 0x93 ||
+      bytes[1] !== 0x4e || bytes[2] !== 0x55 || bytes[3] !== 0x4d ||
+      bytes[4] !== 0x50 || bytes[5] !== 0x59) {
+    throw new Error("Not a valid .npy file (bad magic)");
+  }
+  const major = bytes[6];
+  let headerLen, headerStart;
+  if (major === 1) {
+    headerLen = bytes[8] | (bytes[9] << 8);
+    headerStart = 10;
+  } else {
+    headerLen = bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24);
+    headerStart = 12;
+  }
+  const header = new TextDecoder().decode(bytes.subarray(headerStart, headerStart + headerLen));
+  const dtypeM = header.match(/'descr':\s*'([^']+)'/);
+  const shapeM = header.match(/'shape':\s*\(([^)]*)\)/);
+  const fortM  = header.match(/'fortran_order':\s*(True|False)/);
+  if (!dtypeM || !shapeM) throw new Error("Bad NPY header: " + header);
+  if (fortM && fortM[1] === "True") throw new Error("Fortran-order NPY not supported");
+  const dtype = dtypeM[1];
+  const shape = shapeM[1].split(",").map(s => s.trim()).filter(Boolean).map(Number);
+
+  const dataOffset = headerStart + headerLen;
+  const buf = bytes.buffer.slice(
+    bytes.byteOffset + dataOffset,
+    bytes.byteOffset + bytes.length,
+  );
+  let data;
+  switch (dtype) {
+    case "<f4": data = new Float32Array(buf); break;
+    case "<f8": data = new Float64Array(buf); break;
+    case "<i4": data = new Int32Array(buf); break;
+    case "<i8": data = new BigInt64Array(buf); break;
+    case "<u4": data = new Uint32Array(buf); break;
+    case "|u1": case "<u1": data = new Uint8Array(buf); break;
+    default: throw new Error(`Unsupported dtype: ${dtype}`);
+  }
+  return { dtype, shape, data };
+}
+
+// ===================================================================
+// NPZ parser  (ZIP_STORED only — np.savez default; np.savez_compressed not supported)
+// ===================================================================
+function parseNpz(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view  = new DataView(arrayBuffer);
+  if (bytes.length < 22) throw new Error("File too small to be NPZ");
+
+  // 1) Find End-of-Central-Directory by scanning backwards for signature 0x06054b50
+  let eocd = -1;
+  const maxBack = Math.min(bytes.length, 65557);  // EOCD + max comment
+  for (let i = bytes.length - 22; i >= bytes.length - maxBack; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("Not a ZIP/NPZ (no EOCD signature)");
+
+  const totalEntries = view.getUint16(eocd + 10, true);
+  const cdOffset     = view.getUint32(eocd + 16, true);
+
+  // 2) Walk Central Directory entries
+  const entries = {};
+  let p = cdOffset;
+  for (let i = 0; i < totalEntries; i++) {
+    if (view.getUint32(p, true) !== 0x02014b50) throw new Error("Bad CD entry signature");
+    const compMethod  = view.getUint16(p + 10, true);
+    const compSize    = view.getUint32(p + 20, true);
+    const uncompSize  = view.getUint32(p + 24, true);
+    const nameLen     = view.getUint16(p + 28, true);
+    const extraLen    = view.getUint16(p + 30, true);
+    const commentLen  = view.getUint16(p + 32, true);
+    const localOffset = view.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nameLen));
+
+    if (compMethod !== 0) {
+      throw new Error(`NPZ entry "${name}" is compressed (method ${compMethod}). Use np.savez (not savez_compressed).`);
+    }
+    if (view.getUint32(localOffset, true) !== 0x04034b50) throw new Error("Bad local header");
+    const lhNameLen  = view.getUint16(localOffset + 26, true);
+    const lhExtraLen = view.getUint16(localOffset + 28, true);
+    const dataOffset = localOffset + 30 + lhNameLen + lhExtraLen;
+
+    const npyBytes = bytes.subarray(dataOffset, dataOffset + uncompSize);
+    const key = name.replace(/\.npy$/i, "");
+    try {
+      entries[key] = parseNpy(npyBytes);
+    } catch (err) {
+      // Skip keys we can't parse (e.g. string dtypes like `<U9` from GT npz metadata).
+      console.warn(`[viz] skipping NPZ entry "${key}": ${err.message}`);
+    }
+
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+// ===================================================================
+// Reshape flat TypedArray + shape into nested JS arrays  [N, J, 3]
+// ===================================================================
+function jointsFromNpy(npy) {
+  if (npy.shape.length !== 3 || npy.shape[2] !== 3) {
+    throw new Error(`Expected joints shape [N, J, 3]; got [${npy.shape.join(", ")}]`);
+  }
+  const [N, J] = npy.shape;
+  const d = npy.data;
+  const out = new Array(N);
+  let off = 0;
+  for (let f = 0; f < N; f++) {
+    const fr = new Array(J);
+    for (let j = 0; j < J; j++) {
+      fr[j] = [d[off], d[off + 1], d[off + 2]];
+      off += 3;
+    }
+    out[f] = fr;
+  }
+  return out;
+}
+
+// ===================================================================
+// Drop / picker handling
+// ===================================================================
+// Drop / picker handling — DataTransferItemList becomes invalid after a single
+// await, so we MUST snapshot entries synchronously before doing any async work.
+function getFile(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+async function readDirectoryRecursive(dirEntry) {
+  const reader = dirEntry.createReader();
+  const all = [];
+  // readEntries may return in chunks; keep calling until empty.
+  while (true) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (batch.length === 0) break;
+    for (const e of batch) {
+      if (e.isFile) all.push(await getFile(e));
+      else if (e.isDirectory) all.push(...(await readDirectoryRecursive(e)));
+    }
+  }
+  return all;
+}
+function snapshotEntries(dt) {
+  // Synchronous: grab everything we'll need before the first await.
+  const out = { entries: [], directFiles: [] };
+  if (dt.items && dt.items.length) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const it = dt.items[i];
+      if (typeof it.webkitGetAsEntry === "function") {
+        const e = it.webkitGetAsEntry();
+        if (e) out.entries.push(e);
+      }
+    }
+  }
+  if (dt.files) {
+    for (let i = 0; i < dt.files.length; i++) out.directFiles.push(dt.files[i]);
+  }
+  return out;
+}
+async function gatherFromDataTransfer(dt) {
+  const { entries, directFiles } = snapshotEntries(dt);
+  console.log("[viz] drop snapshot: entries=" + entries.length + " directFiles=" + directFiles.length);
+  const files = [];
+  if (entries.length) {
+    for (const entry of entries) {
+      try {
+        if (entry.isFile) files.push(await getFile(entry));
+        else if (entry.isDirectory) files.push(...(await readDirectoryRecursive(entry)));
+      } catch (err) {
+        console.warn("[viz] entry read failed for " + (entry.name || "?") + ":", err);
+      }
+    }
+  }
+  if (files.length === 0 && directFiles.length) {
+    for (const f of directFiles) files.push(f);
+  }
+  return files;
+}
+
+const errEl = document.getElementById("err");
+function showErr(msg) { errEl.textContent = msg; }
+function clearErr() { errEl.textContent = ""; }
+
+async function ingestFiles(files) {
+  clearErr();
+  console.log("[viz] ingestFiles got " + files.length + " files: ", files.map(f => f.name));
+  let genFile = null, gtFile = null, audioFile = null;
+  for (const f of files) {
+    const n = f.name.toLowerCase();
+    if (n === "gen_position.npz" || n.endsWith("/gen_position.npz")) genFile = f;
+    else if (n === "gt_position.npz" || n.endsWith("/gt_position.npz")) gtFile = f;
+    else if (n === "speech.wav" || n.endsWith(".wav")) audioFile = audioFile || f;
+    else if (n.endsWith(".npz") && !genFile) genFile = f;
+    else if (n.endsWith(".npz") && !gtFile) gtFile = f;
+  }
+  if (!genFile || !gtFile) {
+    const got = files.length
+      ? files.map(f => f.name).join(", ")
+      : "(nothing — the browser didn't pass any File objects; if you used VSCode Simple Browser, try Chrome/Firefox)";
+    showErr(`Need both gen_position.npz and gt_position.npz. Got: ${got}`);
+    return;
+  }
+  try {
+    const [genBuf, gtBuf] = await Promise.all([genFile.arrayBuffer(), gtFile.arrayBuffer()]);
+    const genNpz = parseNpz(genBuf);
+    const gtNpz  = parseNpz(gtBuf);
+    if (!genNpz.joints) throw new Error("gen.npz has no 'joints' array (keys: " + Object.keys(genNpz).join(", ") + ")");
+    if (!gtNpz.joints)  throw new Error("gt.npz has no 'joints' array (keys: " + Object.keys(gtNpz).join(", ") + ")");
+    const genJoints = jointsFromNpy(genNpz.joints);
+    const gtJoints  = jointsFromNpy(gtNpz.joints);
+    startViewer(genJoints, gtJoints, audioFile);
+  } catch (err) {
+    showErr(`Failed to load: ${err.message}`);
+    console.error(err);
+  }
+}
+
+// Drop zone
+const drop = document.getElementById("drop");
+const pickerFiles  = document.getElementById("pickerFiles");
+const pickerFolder = document.getElementById("pickerFolder");
+document.getElementById("pickFiles").addEventListener("click", (e) => {
+  e.stopPropagation(); pickerFiles.click();
+});
+document.getElementById("pickFolder").addEventListener("click", (e) => {
+  e.stopPropagation(); pickerFolder.click();
+});
+pickerFiles.addEventListener("change", () => {
+  console.log("[viz] file picker: " + pickerFiles.files.length + " files");
+  ingestFiles(Array.from(pickerFiles.files));
+});
+pickerFolder.addEventListener("change", () => {
+  console.log("[viz] folder picker: " + pickerFolder.files.length + " files");
+  ingestFiles(Array.from(pickerFolder.files));
+});
+drop.addEventListener("dragover",  e => { e.preventDefault(); drop.classList.add("dragging"); });
+drop.addEventListener("dragleave", e => { drop.classList.remove("dragging"); });
+drop.addEventListener("drop", async e => {
+  e.preventDefault();
+  drop.classList.remove("dragging");
+  console.log("[viz] drop event fired");
+  const files = await gatherFromDataTransfer(e.dataTransfer);
+  ingestFiles(files);
+});
+
+// ===================================================================
+// Viewer (Plotly skeleton + audio sync)
+// ===================================================================
+function startViewer(genRaw, gtRaw, audioFile) {
+  // Hide drop zone, show viewer
+  drop.style.display = "none";
+  document.getElementById("viewer").classList.add("active");
+
+  // SMPLX (Y-up) -> Plotly (Z-up); negate Y to face the camera.
+  const toPlotAxes = j => j.map(fr => fr.map(p => [p[0], -p[2], p[1]]));
+  let gen = toPlotAxes(genRaw);
+  let gt  = toPlotAxes(gtRaw);
+  const N = Math.min(gen.length, gt.length);
+  gen = gen.slice(0, N); gt = gt.slice(0, N);
+
+  // Center each skeleton's frame-0 pelvis at origin.
+  const center = (joints) => {
+    const p0 = joints[0][0];
+    return joints.map(fr => fr.map(j => [j[0]-p0[0], j[1]-p0[1], j[2]-p0[2]]));
+  };
+  gen = center(gen);
+  gt  = center(gt);
+
+  // Build bones from PARENTS.
+  const bones = [];
+  for (let i = 0; i < PARENTS.length; i++) if (PARENTS[i] !== -1) bones.push([PARENTS[i], i]);
+  const boneLines = (frame) => {
+    const xs = [], ys = [], zs = [];
+    for (const [p, c] of bones) {
+      xs.push(frame[p][0], frame[c][0], null);
+      ys.push(frame[p][1], frame[c][1], null);
+      zs.push(frame[p][2], frame[c][2], null);
+    }
+    return [xs, ys, zs];
+  };
+  const genBones = gen.map(boneLines);
+  const gtBones  = gt.map(boneLines);
+  const genX = gen.map(fr => fr.map(j => j[0]));
+  const genY = gen.map(fr => fr.map(j => j[1]));
+  const genZ = gen.map(fr => fr.map(j => j[2]));
+  const gtX  = gt.map(fr => fr.map(j => j[0]));
+  const gtY  = gt.map(fr => fr.map(j => j[1]));
+  const gtZ  = gt.map(fr => fr.map(j => j[2]));
+
+  // Axis range covering both skeletons across all frames.
+  let mnX=Infinity, mxX=-Infinity, mnY=Infinity, mxY=-Infinity, mnZ=Infinity, mxZ=-Infinity;
+  for (const set of [gen, gt]) for (const fr of set) for (const j of fr) {
+    if (j[0]<mnX) mnX=j[0]; if (j[0]>mxX) mxX=j[0];
+    if (j[1]<mnY) mnY=j[1]; if (j[1]>mxY) mxY=j[1];
+    if (j[2]<mnZ) mnZ=j[2]; if (j[2]>mxZ) mxZ=j[2];
+  }
+  const pad = 0.3; mnX-=pad; mxX+=pad; mnY-=pad; mxY+=pad; mnZ-=pad; mxZ+=pad;
+  const span = Math.max(mxX-mnX, mxY-mnY, mxZ-mnZ);
+
+  const initial = [
+    { x: genBones[0][0], y: genBones[0][1], z: genBones[0][2], mode: "lines", type: "scatter3d",
+      line: { width: 4, color: "royalblue" }, name: "gen bones" },
+    { x: genX[0], y: genY[0], z: genZ[0], mode: "markers", type: "scatter3d",
+      marker: { size: 2.5, color: "crimson" }, name: "gen joints" },
+    { x: gtBones[0][0], y: gtBones[0][1], z: gtBones[0][2], mode: "lines", type: "scatter3d",
+      line: { width: 4, color: "seagreen" }, name: "gt bones" },
+    { x: gtX[0], y: gtY[0], z: gtZ[0], mode: "markers", type: "scatter3d",
+      marker: { size: 2.5, color: "darkorange" }, name: "gt joints" },
+  ];
+  const layout = {
+    scene: {
+      xaxis: { range: [mnX, mnX+span], title: "X" },
+      yaxis: { range: [mnY, mnY+span], title: "Y" },
+      zaxis: { range: [mnZ, mnZ+span], title: "Z" },
+      aspectmode: "cube",
+    },
+    margin: { l: 0, r: 0, t: 0, b: 0 },
+    showlegend: false,
+  };
+  Plotly.newPlot("plot", initial, layout, { responsive: true, displayModeBar: true });
+
+  const slider   = document.getElementById("slider");
+  const frameLbl = document.getElementById("frameLbl");
+  const playBtn  = document.getElementById("play");
+  const aud      = document.getElementById("aud");
+  slider.max = N - 1;
+
+  if (audioFile) aud.src = URL.createObjectURL(audioFile);
+
+  let currentFrame = -1;
+  function renderFrame(idx) {
+    if (idx < 0) idx = 0; else if (idx >= N) idx = N - 1;
+    if (idx === currentFrame) return;
+    currentFrame = idx;
+    Plotly.restyle("plot", {
+      x: [genBones[idx][0], genX[idx], gtBones[idx][0], gtX[idx]],
+      y: [genBones[idx][1], genY[idx], gtBones[idx][1], gtY[idx]],
+      z: [genBones[idx][2], genZ[idx], gtBones[idx][2], gtZ[idx]],
+    }, [0, 1, 2, 3]);
+    slider.value = idx;
+    frameLbl.textContent = `frame ${idx} / ${N-1}`;
+  }
+  renderFrame(0);
+
+  // Audio drives animation; if no audio, the play button uses rAF wall-clock instead.
+  let rafId = null;
+  let fallbackStart = 0;  // wall clock when "play" was pressed (no-audio mode)
+  let fallbackOffset = 0; // frame at the time play was pressed
+
+  function tickWithAudio() {
+    renderFrame(Math.floor(aud.currentTime * FPS));
+    if (!aud.paused && !aud.ended) {
+      rafId = requestAnimationFrame(tickWithAudio);
+    } else {
+      rafId = null; playBtn.textContent = "▶︎";
+    }
+  }
+  function tickNoAudio() {
+    const elapsed = (performance.now() - fallbackStart) / 1000;
+    const idx = fallbackOffset + Math.floor(elapsed * FPS);
+    if (idx >= N - 1) { renderFrame(N - 1); rafId = null; playBtn.textContent = "▶︎"; return; }
+    renderFrame(idx);
+    rafId = requestAnimationFrame(tickNoAudio);
+  }
+
+  playBtn.addEventListener("click", () => {
+    if (audioFile) {
+      if (aud.paused) aud.play(); else aud.pause();
+    } else {
+      if (rafId) {
+        cancelAnimationFrame(rafId); rafId = null; playBtn.textContent = "▶︎";
+      } else {
+        fallbackStart = performance.now();
+        fallbackOffset = currentFrame >= N - 1 ? 0 : currentFrame;
+        playBtn.textContent = "❚❚";
+        rafId = requestAnimationFrame(tickNoAudio);
+      }
+    }
+  });
+  aud.addEventListener("play",  () => { playBtn.textContent = "❚❚"; if (!rafId) rafId = requestAnimationFrame(tickWithAudio); });
+  aud.addEventListener("pause", () => { playBtn.textContent = "▶︎"; });
+  aud.addEventListener("seeked", () => { renderFrame(Math.floor(aud.currentTime * FPS)); });
+
+  slider.addEventListener("input", () => {
+    const idx = parseInt(slider.value, 10);
+    renderFrame(idx);
+    if (audioFile && !isNaN(aud.duration)) aud.currentTime = idx / FPS;
+    fallbackOffset = idx;
+    fallbackStart = performance.now();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && e.target.tagName !== "INPUT") {
+      e.preventDefault(); playBtn.click();
+    }
+  });
+
+  // --- toggle GT visibility (traces 2 = gt bones, 3 = gt joints) ---
+  const toggleGtBtn = document.getElementById("toggleGt");
+  let gtVisible = true;
+  toggleGtBtn.addEventListener("click", () => {
+    gtVisible = !gtVisible;
+    Plotly.restyle("plot", { visible: [gtVisible, gtVisible] }, [2, 3]);
+    toggleGtBtn.textContent = gtVisible ? "Hide GT" : "Show GT";
+  });
+}
+</script>
+</body>
+</html>
