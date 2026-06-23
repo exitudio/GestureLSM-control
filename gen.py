@@ -30,6 +30,8 @@ _my_parser.add_argument("--gt", default=None,
 _my_parser.add_argument("--out", default="visualize/output",
                         help="Output directory. Created if missing.")
 _my_parser.add_argument("--config", "-c", default="configs/shortcut_rvqvae_128_hf.yaml")
+_my_parser.add_argument("--no-cache", action="store_true",
+                        help="Force rebuild of MFA TextGrid + dataloader LMDB cache.")
 _my_args, _rest = _my_parser.parse_known_args()
 sys.argv = [sys.argv[0], "-c", _my_args.config] + _rest
 
@@ -37,9 +39,16 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("MASTER_ADDR", "127.0.0.3")
 os.environ.setdefault("MASTER_PORT", "8678")
 
+# Auto-enable HF offline mode if whisper-tiny.en is already cached. Avoids the
+# ~5-10s HF Hub validation round-trip on every run.
+_hf_cache = os.path.expanduser("~/.cache/huggingface/hub/models--openai--whisper-tiny.en")
+if "HF_HUB_OFFLINE" not in os.environ and os.path.exists(_hf_cache):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+import hashlib
+
 import shutil
 import subprocess
-import time
 import warnings
 
 import librosa
@@ -67,16 +76,22 @@ DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 # ===================================================================
 class HTMLTrainer:
     def __init__(self, args, cfg, audio_file, pose_file=None):
-        time_local = time.localtime()
-        tag = "%02d%02d_%02d%02d%02d_" % (
-            time_local[1], time_local[2], time_local[3], time_local[4], time_local[5]
-        )
-        self.tag = tag
-        tmp_dir = os.path.join(args.out_path, "custom", tag + "html")
+        # Stable per-audio tmp dir so MFA TextGrid + dataloader LMDB cache can be
+        # reused across runs. Keyed on audio content + pose path so any input change
+        # invalidates the cache automatically.
+        with open(audio_file, "rb") as _af:
+            _audio_hash = hashlib.md5(_af.read()).hexdigest()[:10]
+        _pose_tag = hashlib.md5((pose_file or "").encode()).hexdigest()[:6]
+        cache_tag = f"audio_{_audio_hash}_{_pose_tag}"
+        self.tag = cache_tag
+        tmp_dir = os.path.join(args.out_path, "custom", cache_tag)
         os.makedirs(tmp_dir, exist_ok=True)
 
+        force_rebuild = getattr(_my_args, "no_cache", False)
+
         self.audio_path = os.path.join(tmp_dir, "tmp.wav")
-        shutil.copy(audio_file, self.audio_path)
+        if force_rebuild or not os.path.exists(self.audio_path):
+            shutil.copy(audio_file, self.audio_path)
 
         # Pose source for the dataloader (paired with the audio: used for seed +
         # length reference). Defaults to the .npz sibling of the audio file.
@@ -86,16 +101,27 @@ class HTMLTrainer:
 
         audio, ssr = librosa.load(self.audio_path, sr=args.audio_sr)
 
-        # ASR → text → MFA → TextGrid (same as demo.py)
+        # ASR → text → MFA → TextGrid. Skip if cached TextGrid already exists.
         lab_path = os.path.join(tmp_dir, "tmp.lab")
         self.textgrid_path = os.path.join(tmp_dir, "tmp.TextGrid")
-        text = ASR_PIPE(audio, batch_size=8)["text"]
-        with open(lab_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        cmd = ["mfa", "align", tmp_dir, "english_us_arpa", "english_us_arpa", tmp_dir]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning(f"mfa stderr: {result.stderr}")
+        if force_rebuild and os.path.exists(self.textgrid_path):
+            os.remove(self.textgrid_path)
+        if os.path.exists(self.textgrid_path):
+            logger.info(f"✓ cached TextGrid: {self.textgrid_path}")
+        else:
+            text = ASR_PIPE(audio, batch_size=8)["text"]
+            with open(lab_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            cmd = ["mfa", "align", tmp_dir, "english_us_arpa", "english_us_arpa", tmp_dir]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning(f"mfa stderr: {result.stderr}")
+
+        # Optionally wipe the dataloader's LMDB cache so it rebuilds fresh.
+        if force_rebuild:
+            lmdb_dir = os.path.join(tmp_dir, "test", f"{args.pose_rep}_cache")
+            if os.path.exists(lmdb_dir):
+                shutil.rmtree(lmdb_dir)
 
         self.args = args
         self.cfg = cfg
