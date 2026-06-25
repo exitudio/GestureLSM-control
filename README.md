@@ -17,6 +17,16 @@
 - [ ] MeanFlow Training Code (Coming Soon)
 - [ ] Merge with [Intentional-Gesture](https://github.com/andypinxinliu/Intentional-Gesture)
 
+# 📚 Additional Docs (`agents_info/`)
+
+Working notes, pipeline docs, and design plans live in [`agents_info/`](./agents_info/):
+
+| File | What it covers |
+|---|---|
+| [`agents_info/visualize_README.md`](./agents_info/visualize_README.md) | Index for the `visualize/` tooling (viewer, trim helper, data folders). |
+| [`agents_info/VISUALIZATION.md`](./agents_info/VISUALIZATION.md) | End-to-end audio-to-gesture visualization pipeline: `gen.py`, `visualize.html` viewer, NPZ schemas, caching, gotchas. |
+| [`agents_info/omnicontrol_spatial_guidance.md`](./agents_info/omnicontrol_spatial_guidance.md) | Design plan for OmniControl-style training-free spatial guidance at inference. |
+
 ## 🔄 Code Updates
 
 **Latest Update**: The codebase has been cleaned and restructured. For legacy or historical information, please check out the `old` branch.
@@ -127,7 +137,7 @@ GestureLSM/
 
 ![Beat Results](beat-new.png)
 
-This table shows the results of 1-speaker and all-speaker comparisons. RAG-Gesture refers to [**Retrieving Semantics from the Deep: an RAG Solution for Gesture Synthesis**](https://arxiv.org/abs/2412.06786), accepted by CVPR 2025. The stats for 1-speaker is based on speaker-id of 2, 'scott' in order to be consistent with the previous SOTA methods. I directly copied the stats from the RAG-Gesture repo, which is different from the stats in the current paper. 
+This table shows the results of 1-speaker and all-speaker comparisons. RAG-Gesture refers to [**Retrieving Semantics from the Deep: an RAG Solution for Gesture Synthesis**](https://arxiv.org/abs/2412.06786), accepted by CVPR 2025. The stats for 1-speaker is based on speaker-id of 2, 'scott' in order to be consistent with the previous SOTA methods. I directly copied the stats from the RAG-Gesture repo, which is different from the stats in the current paper.
 
 ## Important Notes
 
@@ -169,7 +179,7 @@ gdown https://drive.google.com/drive/folders/1MCks7CMNBtAzU2XihYezNmiGT_6pWex8?u
 
 ### Available Checkpoints
 - **Diffusion Model**: `ckpt/new_540_diffusion.bin`
-- **Shortcut Model**: `ckpt/shortcut_reflow.bin` 
+- **Shortcut Model**: `ckpt/shortcut_reflow.bin`
 - **MeanFlow Model**: `ckpt/meanflow.pth`
 - **RVQ-VAE Models**: `ckpt/net_300000_upper.pth`, `ckpt/net_300000_hands.pth`, `ckpt/net_300000_lower.pth`
 
@@ -233,9 +243,9 @@ python train.py --config configs_new/meanflow_rvqvae_128.yaml --ckpt ckpt/meanfl
 | **Shortcut** | 20 | 0.4040 | 0.7144 | 13.4874 | Fast |
 | **Shortcut-ReFlow** | 2 | 0.4104 | 0.7182 | **13.678** | Fast |
 
-**Legend**: 
+**Legend**:
 - **FGD Score** (↓): Lower is better - measures gesture quality
-- **Beat Constancy** (↑): Higher is better - measures audio-gesture synchronization  
+- **Beat Constancy** (↑): Higher is better - measures audio-gesture synchronization
 - **L1Div Score** (↑): Higher is better - measures diversity of generated gestures
 
 **Recommendation**: **MeanFlow** is the clear winner, offering the best FGD and L1Div scores with the fastest inference speed.
@@ -245,12 +255,12 @@ python train.py --config configs_new/meanflow_rvqvae_128.yaml --ckpt ckpt/meanfl
 ```bash
 # Old testing commands (deprecated)
 python test.py -c configs/shortcut_rvqvae_128.yaml
-python test.py -c configs/shortcut_reflow_test.yaml  
+python test.py -c configs/shortcut_reflow_test.yaml
 python test.py -c configs/diffuser_rvqvae_128.yaml
 ```
 
 ## Train RVQ-VAEs (1-speaker)
-> Require download dataset 
+> Require download dataset
 ```
 bash train_rvq.sh
 ```
@@ -267,7 +277,7 @@ The codebase now uses a unified `train.py` script for training all models. Use t
 # Train Diffusion Model
 python train.py --config configs_new/diffusion_rvqvae_128.yaml
 
-# Train Shortcut Model  
+# Train Shortcut Model
 python train.py --config configs_new/shortcut_rvqvae_128.yaml
 
 # Train MeanFlow Model
