@@ -23,7 +23,7 @@ english_us_arpa
 with-proxy python demo.py -c configs/shortcut_rvqvae_128_hf.yaml
 ```
 ### in local machine
-```ssh -L 7860:localhost:7860 ekkasit@devvm2948.hil0.facebook.com```
+```ssh -L 7860:localhost:7860 ekkasit@devvm24589.ldc0.facebook.com```
 
 ### Run generation with HTML visualization
 with-proxy python demo_html.py \
@@ -37,7 +37,7 @@ with-proxy python demo_html.py \
 bash train_rvq.sh
 
 
-# generate
+############# Generate ##########################
 ## first time
 ```
 # $unset HF_HUB_OFFLINE
@@ -49,9 +49,22 @@ export HF_HUB_OFFLINE=1
 python gen.py
 ```
 
-## Trimmed
-with-proxy python gen.py --audio visualize/input/2_scott_0_1_1_128f.wav --out visualize/output_128f
+## Gen from Trimmed
+python gen.py --audio visualize/input/2_scott_0_1_1_128f.wav --out visualize/output_128f
+#### with control
+python gen.py --mode diffusion --audio visualize/input/2_scott_0_1_1_128f.wav --out visualize/output_128f --guidance_freeze_root false
+## trim sample
+python trim.py
+
+
+#### Data Representation ####
+./data_representation.html
 
 
 
 
+##### Tasks #####
+1. Control for long sequence concatenate chunks, the control position is not aligned.
+2. guidance_freeze_root ???
+3. SMPL model condition for each person -- foot skating better?
+4. Eval with GT joint control

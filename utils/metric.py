@@ -7,6 +7,7 @@ import librosa.display
 from matplotlib.pyplot import figure
 import math
 from scipy.signal import argrelextrema
+from scipy.ndimage import uniform_filter1d
 
 
 class L1div(object):
@@ -26,6 +27,99 @@ class L1div(object):
         self.counter = 0
         self.sum = 0
         
+
+def _default_foot_indices(joint_count):
+    if joint_count > 65:
+        return (60, 61, 62, 63, 64, 65)
+    return (10, 11)
+
+
+def calculate_foot_skating_metrics(
+    motions,
+    fps=30.0,
+    thresh_height=0.05,
+    thresh_vels=(0.10, 0.20, 0.50),
+    avg_window=5,
+    foot_indices=None,
+):
+    if hasattr(motions, "detach"):
+        motions = motions.detach().cpu().numpy()
+    motions = np.asarray(motions)
+    if motions.ndim != 4 or motions.shape[-1] != 3:
+        raise ValueError("motions must have shape [B, T, J, 3]")
+
+    batch_size = motions.shape[0]
+    if foot_indices is None:
+        foot_indices = _default_foot_indices(motions.shape[2])
+    foot_indices = tuple(i for i in foot_indices if i < motions.shape[2])
+    if len(foot_indices) == 0:
+        raise ValueError("No valid foot indices for motions")
+
+    empty = np.zeros((batch_size,), dtype=np.float32)
+    if motions.shape[1] < 2:
+        metrics = {f"ratio_{int(v * 100):03d}": empty.copy() for v in thresh_vels}
+        metrics["speed"] = empty.copy()
+        metrics["distance"] = empty.copy()
+        return metrics, np.zeros((batch_size, len(foot_indices), 0), dtype=np.float32)
+
+    feet = motions[:, :, foot_indices, :].transpose(0, 2, 3, 1)
+    feet_plane_vel = (
+        np.linalg.norm(
+            feet[:, :, [0, 2], 1:] - feet[:, :, [0, 2], :-1],
+            axis=2,
+        )
+        * fps
+    )
+    vel_avg = uniform_filter1d(
+        feet_plane_vel, axis=-1, size=avg_window, mode="constant", origin=0
+    )
+
+    feet_height = feet[:, :, 1, :]
+    feet_contact = np.logical_and(
+        feet_height[:, :, :-1] < thresh_height,
+        feet_height[:, :, 1:] < thresh_height,
+    )
+    skate_vel = feet_contact * vel_avg
+
+    metrics = {}
+    for thresh_vel in thresh_vels:
+        skating = np.logical_and(feet_contact, feet_plane_vel > thresh_vel)
+        skating = np.logical_and(skating, vel_avg > thresh_vel)
+        skating = np.any(skating, axis=1)
+        metrics[f"ratio_{int(thresh_vel * 100):03d}"] = (
+            np.sum(skating, axis=1) / skating.shape[1]
+        )
+
+    contact_count = np.sum(feet_contact, axis=(1, 2))
+    contact_vel_sum = np.sum(feet_plane_vel * feet_contact, axis=(1, 2))
+    metrics["speed"] = np.divide(
+        contact_vel_sum,
+        contact_count,
+        out=np.zeros_like(contact_vel_sum, dtype=np.float64),
+        where=contact_count > 0,
+    )
+    metrics["distance"] = np.sum(feet_plane_vel * feet_contact / fps, axis=(1, 2))
+    return metrics, skate_vel
+
+
+def calculate_skating_ratio(
+    motions,
+    fps=30.0,
+    thresh_height=0.05,
+    thresh_vel=0.50,
+    avg_window=5,
+    foot_indices=None,
+):
+    metrics, skate_vel = calculate_foot_skating_metrics(
+        motions,
+        fps=fps,
+        thresh_height=thresh_height,
+        thresh_vels=(thresh_vel,),
+        avg_window=avg_window,
+        foot_indices=foot_indices,
+    )
+    return metrics[f"ratio_{int(thresh_vel * 100):03d}"], skate_vel
+
 
 class SRGR(object):
     def __init__(self, threshold=0.1, joints=47):

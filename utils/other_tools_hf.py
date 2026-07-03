@@ -667,7 +667,8 @@ def render_one_sequence(
     base_filename_without_ext = os.path.splitext(os.path.basename(res_npz_path))[0]
     final_clip = os.path.join(output_dir, f"{base_filename_without_ext}.mp4")
     utils.media.add_audio_to_video(silent_video_file_path, audio_path, final_clip)
-    os.remove(silent_video_file_path)
+    if os.path.exists(silent_video_file_path):
+        os.remove(silent_video_file_path)
     return final_clip
 
 def render_one_sequence_no_gt(
@@ -752,7 +753,8 @@ def render_one_sequence_no_gt(
     base_filename_without_ext = os.path.splitext(os.path.basename(res_npz_path))[0]
     final_clip = os.path.join(output_dir, f"{base_filename_without_ext}.mp4")
     utils.media.add_audio_to_video(silent_video_file_path, audio_path, final_clip)
-    os.remove(silent_video_file_path)
+    if os.path.exists(silent_video_file_path):
+        os.remove(silent_video_file_path)
     return final_clip
 
 def print_exp_info(args):

@@ -1,8 +1,10 @@
 model:
-  model_name: GestureDiffuse
+  model_name: Diffusion
   g_name: GestureDiffusion
   do_classifier_free_guidance: False
   guidance_scale: 1.5
+  n_steps: 20
+  use_exp: False
 
   denoiser:
     target: models.denoiser.GestureDenoiser
@@ -15,13 +17,16 @@ model:
       dropout: 0.1
       activation: "gelu"
       n_seed: 8
+      seq_len: 32
       flip_sin_to_cos: True
       freq_shift: 0.0
+      cond_proj_dim: 256
+      use_exp: ${model.use_exp}
       
 
 
   modality_encoder:
-    target: models.modality_encoder.ModalityEncoder
+    target: models.layers.modality_encoder.ModalityEncoder
     params:
       data_path: ./datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/
       t_fix_pre: False
@@ -30,6 +35,9 @@ model:
       raw_audio: False
       latent_dim: 256
       audio_fps: 30
+      target_length: 128
+      spatial_temporal: True
+      use_exp: ${model.use_exp}
 
 
   scheduler:

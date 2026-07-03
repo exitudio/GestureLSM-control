@@ -108,6 +108,10 @@ class RVQVAE(nn.Module):
         # x_out = self.postprocess(x_decoder)
         return x_out, commit_loss, perplexity
 
+    def decode_continuous(self, x):
+        x = x.permute(0,2,1)
+        return self.decoder(x)
+
 
 class LengthEstimator(nn.Module):
     def __init__(self, input_size, output_size):

@@ -113,6 +113,7 @@ def parse_args(config_path=None):
     parser.add("--disable_filtering", default=False, type=str2bool)
     parser.add("--clean_first_seconds", default=0, type=int)
     parser.add("--clean_final_seconds", default=0, type=int)
+    parser.add("--test_clip", default=False, type=str2bool)
 
     parser.add("--audio_rep", default=None, type=str)
     parser.add("--audio_raw", default='wavlm', type=str)

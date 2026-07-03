@@ -44,7 +44,8 @@
     <span style="color:royalblue">■</span> generation bones &nbsp;
     <span style="color:crimson">●</span> generation joints &nbsp;
     <span style="color:seagreen">■</span> ground-truth bones &nbsp;
-    <span style="color:darkorange">●</span> ground-truth joints
+    <span style="color:darkorange">●</span> ground-truth joints &nbsp;
+    <span style="color:magenta">◆</span> control points
   </div>
 </header>
 
@@ -52,8 +53,8 @@
 <div id="drop">
   <div class="inner">
     <h2>Drag your output folder here</h2>
-    <p>…or drop <code>gen_position.npz</code>, <code>gt_position.npz</code>, and <code>speech.wav</code>.</p>
-    <p>(audio is optional — without it the slider still works.)</p>
+    <p>…or drop <code>gen_position.npz</code>, <code>gt_position.npz</code>, optional <code>control_position.npz</code>, and <code>speech.wav</code>.</p>
+    <p>(audio and control points are optional — without them the slider still works.)</p>
     <div style="display:flex; gap:8px; justify-content:center; margin-top:16px;">
       <button id="pickFolder">Choose folder…</button>
       <button id="pickFiles">Choose files…</button>
@@ -214,6 +215,37 @@ function jointsFromNpy(npy) {
   }
   return out;
 }
+function vectorFromNpy(npy, name) {
+  if (npy.shape.length !== 1) {
+    throw new Error(`Expected ${name} shape [K]; got [${npy.shape.join(", ")}]`);
+  }
+  return Array.from(npy.data, v => Number(v));
+}
+function pointsFromNpy(npy) {
+  if (npy.shape.length !== 2 || npy.shape[1] !== 3) {
+    throw new Error(`Expected points shape [K, 3]; got [${npy.shape.join(", ")}]`);
+  }
+  const [K] = npy.shape;
+  const d = npy.data;
+  const out = new Array(K);
+  let off = 0;
+  for (let i = 0; i < K; i++) {
+    out[i] = [d[off], d[off + 1], d[off + 2]];
+    off += 3;
+  }
+  return out;
+}
+function controlFromNpz(npz) {
+  if (!npz.frames) throw new Error("control_position.npz has no 'frames' array");
+  if (!npz.points) throw new Error("control_position.npz has no 'points' array");
+  const frames = vectorFromNpy(npz.frames, "frames");
+  const joints = npz.joints ? vectorFromNpy(npz.joints, "joints") : frames.map(() => -1);
+  const points = pointsFromNpy(npz.points);
+  if (frames.length !== points.length || joints.length !== points.length) {
+    throw new Error("control_position.npz frames, joints, and points lengths do not match");
+  }
+  return points.map((point, i) => ({ frame: frames[i], joint: joints[i], point }));
+}
 
 // ===================================================================
 // Drop / picker handling
@@ -281,11 +313,12 @@ function clearErr() { errEl.textContent = ""; }
 async function ingestFiles(files) {
   clearErr();
   console.log("[viz] ingestFiles got " + files.length + " files: ", files.map(f => f.name));
-  let genFile = null, gtFile = null, audioFile = null;
+  let genFile = null, gtFile = null, controlFile = null, audioFile = null;
   for (const f of files) {
     const n = f.name.toLowerCase();
     if (n === "gen_position.npz" || n.endsWith("/gen_position.npz")) genFile = f;
     else if (n === "gt_position.npz" || n.endsWith("/gt_position.npz")) gtFile = f;
+    else if (n === "control_position.npz" || n.endsWith("/control_position.npz")) controlFile = f;
     else if (n === "speech.wav" || n.endsWith(".wav")) audioFile = audioFile || f;
     else if (n.endsWith(".npz") && !genFile) genFile = f;
     else if (n.endsWith(".npz") && !gtFile) gtFile = f;
@@ -298,14 +331,20 @@ async function ingestFiles(files) {
     return;
   }
   try {
-    const [genBuf, gtBuf] = await Promise.all([genFile.arrayBuffer(), gtFile.arrayBuffer()]);
+    const [genBuf, gtBuf, controlBuf] = await Promise.all([
+      genFile.arrayBuffer(),
+      gtFile.arrayBuffer(),
+      controlFile ? controlFile.arrayBuffer() : Promise.resolve(null),
+    ]);
     const genNpz = parseNpz(genBuf);
     const gtNpz  = parseNpz(gtBuf);
+    const controlNpz = controlBuf ? parseNpz(controlBuf) : null;
     if (!genNpz.joints) throw new Error("gen.npz has no 'joints' array (keys: " + Object.keys(genNpz).join(", ") + ")");
     if (!gtNpz.joints)  throw new Error("gt.npz has no 'joints' array (keys: " + Object.keys(gtNpz).join(", ") + ")");
     const genJoints = jointsFromNpy(genNpz.joints);
     const gtJoints  = jointsFromNpy(gtNpz.joints);
-    startViewer(genJoints, gtJoints, audioFile);
+    const controls = controlNpz ? controlFromNpz(controlNpz) : [];
+    startViewer(genJoints, gtJoints, audioFile, controls);
   } catch (err) {
     showErr(`Failed to load: ${err.message}`);
     console.error(err);
@@ -343,7 +382,7 @@ drop.addEventListener("drop", async e => {
 // ===================================================================
 // Viewer (Plotly skeleton + audio sync)
 // ===================================================================
-function startViewer(genRaw, gtRaw, audioFile) {
+function startViewer(genRaw, gtRaw, audioFile, controlRaw=[]) {
   // Hide drop zone, show viewer
   drop.style.display = "none";
   document.getElementById("viewer").classList.add("active");
@@ -352,16 +391,26 @@ function startViewer(genRaw, gtRaw, audioFile) {
   const toPlotAxes = j => j.map(fr => fr.map(p => [p[0], -p[2], p[1]]));
   let gen = toPlotAxes(genRaw);
   let gt  = toPlotAxes(gtRaw);
+  let controls = controlRaw.map(c => ({
+    frame: Math.round(c.frame),
+    joint: Math.round(c.joint),
+    point: [c.point[0], -c.point[2], c.point[1]],
+  }));
   const N = Math.min(gen.length, gt.length);
   gen = gen.slice(0, N); gt = gt.slice(0, N);
 
-  // Center each skeleton's frame-0 pelvis at origin.
-  const center = (joints) => {
-    const p0 = joints[0][0];
-    return joints.map(fr => fr.map(j => [j[0]-p0[0], j[1]-p0[1], j[2]-p0[2]]));
-  };
-  gen = center(gen);
-  gt  = center(gt);
+  // Use the GT frame-0 pelvis as the shared X/Y origin while keeping Plotly Z
+  // in world coordinates so height values stay readable.
+  const centerBy = (joints, p0) => joints.map(fr => fr.map(j => [j[0]-p0[0], j[1]-p0[1], j[2]]));
+  const gtOrigin = gt[0][0];
+  gen = centerBy(gen, gtOrigin);
+  gt  = centerBy(gt, gtOrigin);
+  controls = controls
+    .filter(c => c.frame >= 0 && c.frame < N)
+    .map(c => ({
+      ...c,
+      point: [c.point[0]-gtOrigin[0], c.point[1]-gtOrigin[1], c.point[2]],
+    }));
 
   // Build bones from PARENTS.
   const bones = [];
@@ -391,9 +440,20 @@ function startViewer(genRaw, gtRaw, audioFile) {
     if (j[1]<mnY) mnY=j[1]; if (j[1]>mxY) mxY=j[1];
     if (j[2]<mnZ) mnZ=j[2]; if (j[2]>mxZ) mxZ=j[2];
   }
+  for (const c of controls) {
+    const j = c.point;
+    if (j[0]<mnX) mnX=j[0]; if (j[0]>mxX) mxX=j[0];
+    if (j[1]<mnY) mnY=j[1]; if (j[1]>mxY) mxY=j[1];
+    if (j[2]<mnZ) mnZ=j[2]; if (j[2]>mxZ) mxZ=j[2];
+  }
   const pad = 0.3; mnX-=pad; mxX+=pad; mnY-=pad; mxY+=pad; mnZ-=pad; mxZ+=pad;
   const span = Math.max(mxX-mnX, mxY-mnY, mxZ-mnZ);
 
+  const controlsAtFrame = (idx) => {
+    const pts = controls.filter(c => c.frame === idx).map(c => c.point);
+    return [pts.map(p => p[0]), pts.map(p => p[1]), pts.map(p => p[2])];
+  };
+  const control0 = controlsAtFrame(0);
   const initial = [
     { x: genBones[0][0], y: genBones[0][1], z: genBones[0][2], mode: "lines", type: "scatter3d",
       line: { width: 4, color: "royalblue" }, name: "gen bones" },
@@ -403,6 +463,8 @@ function startViewer(genRaw, gtRaw, audioFile) {
       line: { width: 4, color: "seagreen" }, name: "gt bones" },
     { x: gtX[0], y: gtY[0], z: gtZ[0], mode: "markers", type: "scatter3d",
       marker: { size: 2.5, color: "darkorange" }, name: "gt joints" },
+    { x: control0[0], y: control0[1], z: control0[2], mode: "markers", type: "scatter3d",
+      marker: { size: 8, color: "magenta", symbol: "diamond" }, name: "control points", visible: controls.length > 0 },
   ];
   const layout = {
     scene: {
@@ -429,11 +491,12 @@ function startViewer(genRaw, gtRaw, audioFile) {
     if (idx < 0) idx = 0; else if (idx >= N) idx = N - 1;
     if (idx === currentFrame) return;
     currentFrame = idx;
+    const controlFrame = controlsAtFrame(idx);
     Plotly.restyle("plot", {
-      x: [genBones[idx][0], genX[idx], gtBones[idx][0], gtX[idx]],
-      y: [genBones[idx][1], genY[idx], gtBones[idx][1], gtY[idx]],
-      z: [genBones[idx][2], genZ[idx], gtBones[idx][2], gtZ[idx]],
-    }, [0, 1, 2, 3]);
+      x: [genBones[idx][0], genX[idx], gtBones[idx][0], gtX[idx], controlFrame[0]],
+      y: [genBones[idx][1], genY[idx], gtBones[idx][1], gtY[idx], controlFrame[1]],
+      z: [genBones[idx][2], genZ[idx], gtBones[idx][2], gtZ[idx], controlFrame[2]],
+    }, [0, 1, 2, 3, 4]);
     slider.value = idx;
     frameLbl.textContent = `frame ${idx} / ${N-1}`;
   }
@@ -444,11 +507,14 @@ function startViewer(genRaw, gtRaw, audioFile) {
   let fallbackStart = 0;  // wall clock when "play" was pressed (no-audio mode)
   let fallbackOffset = 0; // frame at the time play was pressed
 
+  const frameFromAudio = () => aud.ended ? N - 1 : Math.min(N - 1, Math.floor(aud.currentTime * FPS));
+
   function tickWithAudio() {
-    renderFrame(Math.floor(aud.currentTime * FPS));
+    renderFrame(frameFromAudio());
     if (!aud.paused && !aud.ended) {
       rafId = requestAnimationFrame(tickWithAudio);
     } else {
+      if (aud.ended) renderFrame(N - 1);
       rafId = null; playBtn.textContent = "▶︎";
     }
   }
@@ -474,14 +540,25 @@ function startViewer(genRaw, gtRaw, audioFile) {
       }
     }
   });
+  let manualSeekFrame = null;
   aud.addEventListener("play",  () => { playBtn.textContent = "❚❚"; if (!rafId) rafId = requestAnimationFrame(tickWithAudio); });
   aud.addEventListener("pause", () => { playBtn.textContent = "▶︎"; });
-  aud.addEventListener("seeked", () => { renderFrame(Math.floor(aud.currentTime * FPS)); });
+  aud.addEventListener("seeked", () => {
+    if (manualSeekFrame !== null) {
+      renderFrame(manualSeekFrame);
+      manualSeekFrame = null;
+    } else {
+      renderFrame(frameFromAudio());
+    }
+  });
 
   slider.addEventListener("input", () => {
     const idx = parseInt(slider.value, 10);
     renderFrame(idx);
-    if (audioFile && !isNaN(aud.duration)) aud.currentTime = idx / FPS;
+    if (audioFile && !isNaN(aud.duration)) {
+      manualSeekFrame = idx;
+      aud.currentTime = Math.min(idx / FPS, Math.max(0, aud.duration - 0.001));
+    }
     fallbackOffset = idx;
     fallbackStart = performance.now();
   });

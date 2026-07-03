@@ -137,6 +137,77 @@ class GestureDiffusion(torch.nn.Module):
 
         return pred_original_sample, pred_epsilon
 
+    def model_output_from_origin(self, pred_original_sample: torch.Tensor, timesteps: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
+        self.alphas = self.alphas.to(pred_original_sample.device)
+        self.sigmas = self.sigmas.to(pred_original_sample.device)
+        alphas = extract_into_tensor(self.alphas, timesteps, sample.shape)
+        sigmas = extract_into_tensor(self.sigmas, timesteps, sample.shape)
+
+        if self.scheduler.config.prediction_type == "epsilon":
+            return (sample - alphas * pred_original_sample) / sigmas
+        if self.scheduler.config.prediction_type == "sample":
+            return pred_original_sample
+        if self.scheduler.config.prediction_type == "v_prediction":
+            pred_epsilon = (sample - alphas * pred_original_sample) / sigmas
+            return alphas * pred_epsilon - sigmas * pred_original_sample
+        raise ValueError(f"Invalid prediction_type {self.scheduler.config.prediction_type}.")
+
+    def _guidance_variance(self, timesteps: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
+        betas = self.scheduler.betas.to(sample.device)
+        alphas_cumprod = self.scheduler.alphas_cumprod.to(sample.device)
+        alphas_cumprod_prev = torch.cat([
+            torch.ones_like(alphas_cumprod[:1]), alphas_cumprod[:-1],
+        ])
+        posterior_variance = betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
+        posterior_variance = torch.cat([
+            posterior_variance[1:2], posterior_variance[1:],
+        ])
+        return extract_into_tensor(posterior_variance, timesteps, sample.shape)
+
+    def _spatial_guidance_step(self, x0, t, guidance_fn, control):
+        hint = control["hint"].to(device=x0.device, dtype=x0.dtype)
+        mask = control["mask"].to(device=x0.device, dtype=x0.dtype)
+        if mask.sum() <= 0:
+            return x0
+
+        if hint.dim() == 3:
+            hint = hint.unsqueeze(0)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        late_start = int(control.get("late_start", 300))
+        n_iters = int(control.get("iters_late", 30) if int(t.item()) <= late_start else control.get("iters_early", 5))
+        if n_iters <= 0:
+            return x0
+
+        active = torch.clamp((mask > 0).sum().to(dtype=x0.dtype), min=1.0)
+        scale = float(control.get("scale", 20.0)) / active
+        weight = float(control.get("weight", 1.0))
+        log_every = int(control.get("log_every", 0))
+        loss_stop = float(control.get("loss_stop", 5e-7))
+        variance = 1
+        x = x0.detach()
+
+        for opt_i in range(n_iters):
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
+                joints = guidance_fn(x, bool(control.get("freeze_root", True)))
+                frame_mask = mask.unsqueeze(-1)
+                diff = (joints - hint) * frame_mask
+                loss = 0.5 * diff.pow(2).sum() * weight
+                grad = torch.autograd.grad(loss, x)[0]
+                x = x - scale * variance * grad
+            loss_value = loss.detach().item()
+            if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
+                print(
+                    f"[guidance] t={int(t.item())} opt={opt_i + 1}/{n_iters} "
+                    f"loss={loss_value:.6f} grad={grad.detach().norm().item():.6f} "
+                    f"variance={variance:.6f}"
+                )
+            if loss_value <= loss_stop:
+                break
+        return x.detach()
+
 
 
     def forward(self, cond_: dict) -> dict:
@@ -146,6 +217,8 @@ class GestureDiffusion(torch.nn.Module):
         id = cond_['y']['id']
         seed = cond_['y']['seed']
         style_feature = cond_['y']['style_feature']
+        control = cond_['y'].get('control')
+        guidance_fn = cond_['y'].get('guidance_fn')
 
         audio_feat = self.modality_encoder(audio, word)
 
@@ -153,7 +226,9 @@ class GestureDiffusion(torch.nn.Module):
         shape_ = (bs, self.input_dim * self.num_joints, 1, self.seq_len)
         latents = torch.randn(shape_, device=audio_feat.device)
 
-        latents = self._diffusion_reverse(latents, seed, audio_feat, guidance_scale=self.guidance_scale)
+        latents = self._diffusion_reverse(
+            latents, seed, audio_feat, guidance_scale=self.guidance_scale,
+            control=control, guidance_fn=guidance_fn)
 
         return latents
 
@@ -165,6 +240,8 @@ class GestureDiffusion(torch.nn.Module):
             seed: torch.Tensor,
             at_feat: torch.Tensor,
             guidance_scale: float = 1,
+            control: Optional[dict] = None,
+            guidance_fn = None,
     ) -> torch.Tensor:
 
         return_dict = {}
@@ -207,6 +284,12 @@ class GestureDiffusion(torch.nn.Module):
                 seed=seed,
                 at_feat=at_feat,
                 guidance_scale=guidance_scale)
+
+            if control is not None and guidance_fn is not None:
+                t_batch = t.expand(latents.shape[0])
+                latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
+                guided_x0 = self._spatial_guidance_step(latents_pred_x0, t, guidance_fn, control)
+                model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
 
             latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
         return_dict['latents'] = latents

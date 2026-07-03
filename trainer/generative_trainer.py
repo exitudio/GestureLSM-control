@@ -42,6 +42,17 @@ def convert_15d_to_6d(motion):
     return motion_6d
 
 
+SKATING_METRIC_MAP = (
+    ("skating_ratio", "ratio_050"),
+    ("skating_ratio_010", "ratio_010"),
+    ("skating_ratio_020", "ratio_020"),
+    ("skating_speed", "speed"),
+    ("skating_distance", "distance"),
+)
+SKATING_METRIC_NAMES = tuple(name for name, _ in SKATING_METRIC_MAP)
+GT_SKATING_METRIC_NAMES = tuple(f"gt_{name}" for name in SKATING_METRIC_NAMES)
+
+
 class CustomTrainer(BaseTrainer):
     """
     Generative Trainer to support various generative models
@@ -94,8 +105,17 @@ class CustomTrainer(BaseTrainer):
             ] = 1
 
         self.tracker = other_tools.EpochTracker(
-            ["fgd", "bc", "l1div", "predict_x0_loss", "test_clip_fgd"],
-            [True, True, True, True, True],
+            [
+                "fgd", "gt_fgd", "bc", "gt_bc", "l1div", "gt_l1div",
+                *SKATING_METRIC_NAMES, *GT_SKATING_METRIC_NAMES,
+                "predict_x0_loss", "test_clip_fgd",
+            ],
+            [
+                True, False, True, True, True, True,
+                *([False] * len(SKATING_METRIC_NAMES)),
+                *([False] * len(GT_SKATING_METRIC_NAMES)),
+                True, True,
+            ],
         )
 
         ##### Model #####
@@ -467,8 +487,6 @@ class CustomTrainer(BaseTrainer):
         else:
             rec_exps = tar_exps
 
-        rec_trans = tar_trans
-
         rec_pose_legs = rec_lower[:, :, :54]
         bs, n = rec_pose_legs.shape[0], rec_pose_legs.shape[1]
         rec_pose_upper = rec_upper.reshape(bs, n, 13, 6)
@@ -563,10 +581,18 @@ class CustomTrainer(BaseTrainer):
         total_length = 0
         test_seq_list = self.test_data.selected_file
         align = 0
+        align_gt = 0
         latent_out = []
         latent_ori = []
         l2_all = 0
         lvel = 0
+        skating_metrics_sum = {name: 0.0 for name in SKATING_METRIC_NAMES}
+        gt_skating_metrics_sum = {name: 0.0 for name in SKATING_METRIC_NAMES}
+        skating_count = 0
+        num_sequences = 0
+        l1_calculator_gt = metric.L1div()
+        if hasattr(self, "l1_calculator"):
+            self.l1_calculator.reset()
         results = []
 
         # Setup save path for test mode
@@ -652,7 +678,8 @@ class CustomTrainer(BaseTrainer):
                 tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs * n, j, 6))
                 tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs * n, j * 3)
 
-                # Generate SMPLX vertices and joints
+                # Generate SMPLX vertices and joints in the translation-free frame used
+                # by the existing BC/L1Div metrics.
                 vertices_rec = self.smplx(
                     betas=tar_beta.reshape(bs * n, 300),
                     transl=rec_trans.reshape(bs * n, 3) - rec_trans.reshape(bs * n, 3),
@@ -667,18 +694,64 @@ class CustomTrainer(BaseTrainer):
                     leye_pose=rec_pose[:, 69:72],
                     reye_pose=rec_pose[:, 72:75],
                 )
+                vertices_tar = self.smplx(
+                    betas=tar_beta.reshape(bs * n, 300),
+                    transl=tar_trans.reshape(bs * n, 3) - tar_trans.reshape(bs * n, 3),
+                    expression=tar_exps.reshape(bs * n, 100)
+                    - tar_exps.reshape(bs * n, 100),
+                    jaw_pose=tar_pose[:, 66:69],
+                    global_orient=tar_pose[:, :3],
+                    body_pose=tar_pose[:, 3 : 21 * 3 + 3],
+                    left_hand_pose=tar_pose[:, 25 * 3 : 40 * 3],
+                    right_hand_pose=tar_pose[:, 40 * 3 : 55 * 3],
+                    return_joints=True,
+                    leye_pose=tar_pose[:, 69:72],
+                    reye_pose=tar_pose[:, 72:75],
+                )
 
-                joints_rec = (
+                joints_rec_full = (
                     vertices_rec["joints"]
                     .detach()
                     .cpu()
                     .numpy()
-                    .reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
+                    .reshape(bs, n, 127, 3)[:, :n]
                 )
+                joints_tar_full = (
+                    vertices_tar["joints"]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(bs, n, 127, 3)[:, :n]
+                )
+                joints_rec_all = joints_rec_full[:, :, :55]
+                joints_tar_all = joints_tar_full[:, :, :55]
+                joints_rec = joints_rec_all[0].reshape(n, 55 * 3)
+                joints_tar = joints_tar_all[0].reshape(n, 55 * 3)
 
-                # Calculate L1 diversity
+                # Calculate L1 diversity. L1div mutates its input, so pass copies.
                 if hasattr(self, "l1_calculator"):
-                    _ = self.l1_calculator.run(joints_rec)
+                    _ = self.l1_calculator.run(joints_rec.copy())
+                    _ = l1_calculator_gt.run(joints_tar.copy())
+
+                if mode != "test_render":
+                    rec_trans_np = rec_trans.reshape(bs, n, 3).detach().cpu().numpy()
+                    tar_trans_np = tar_trans.reshape(bs, n, 3).detach().cpu().numpy()
+                    skating_metrics, _ = metric.calculate_foot_skating_metrics(
+                        joints_rec_full + rec_trans_np[:, :, None, :],
+                        fps=self.cfg.data.pose_fps,
+                    )
+                    gt_skating_metrics, _ = metric.calculate_foot_skating_metrics(
+                        joints_tar_full + tar_trans_np[:, :, None, :],
+                        fps=self.cfg.data.pose_fps,
+                    )
+                    for metric_name, source_name in SKATING_METRIC_MAP:
+                        skating_metrics_sum[metric_name] += float(
+                            np.sum(skating_metrics[source_name])
+                        )
+                        gt_skating_metrics_sum[metric_name] += float(
+                            np.sum(gt_skating_metrics[source_name])
+                        )
+                    skating_count += skating_metrics["ratio_050"].shape[0]
 
                 # Calculate alignment for single batch
                 if (
@@ -713,6 +786,12 @@ class CustomTrainer(BaseTrainer):
                     )
                     align += self.alignmenter.calculate_align(
                         onset_bt, beat_vel, 30
+                    ) * (n - 2 * self.align_mask)
+                    beat_vel_gt = self.alignmenter.load_pose(
+                        joints_tar, self.align_mask, n - self.align_mask, 30, True
+                    )
+                    align_gt += self.alignmenter.calculate_align(
+                        onset_bt, beat_vel_gt, 30
                     ) * (n - 2 * self.align_mask)
 
                 # Mode-specific processing
@@ -864,14 +943,30 @@ class CustomTrainer(BaseTrainer):
                         )
 
                 total_length += n
+                num_sequences += bs
+
+        skating_metrics_avg = {
+            name: skating_metrics_sum[name] / skating_count if skating_count > 0 else 0.0
+            for name in SKATING_METRIC_NAMES
+        }
+        gt_skating_metrics_avg = {
+            f"gt_{name}": gt_skating_metrics_sum[name] / skating_count
+            if skating_count > 0 else 0.0
+            for name in SKATING_METRIC_NAMES
+        }
 
         return {
             "total_length": total_length,
+            "num_sequences": num_sequences,
             "align": align,
+            "align_gt": align_gt,
             "latent_out": latent_out,
             "latent_ori": latent_ori,
             "l2_all": l2_all,
             "lvel": lvel,
+            "gt_l1div": l1_calculator_gt.avg() if l1_calculator_gt.counter > 0 else 0.0,
+            "skating_metrics": skating_metrics_avg,
+            "gt_skating_metrics": gt_skating_metrics_avg,
             "start_time": start_time,
         }
 
@@ -883,11 +978,16 @@ class CustomTrainer(BaseTrainer):
         )
 
         total_length = results["total_length"]
+        num_sequences = results["num_sequences"]
         align = results["align"]
+        align_gt = results["align_gt"]
         latent_out = results["latent_out"]
         latent_ori = results["latent_ori"]
         l2_all = results["l2_all"]
         lvel = results["lvel"]
+        gt_l1div = results["gt_l1div"]
+        skating_metrics = results["skating_metrics"]
+        gt_skating_metrics = results["gt_skating_metrics"]
         start_time = results["start_time"]
 
         logger.info(f"l2 loss: {l2_all/total_length:.10f}")
@@ -899,14 +999,31 @@ class CustomTrainer(BaseTrainer):
         fgd = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"fgd score: {fgd}")
         self.tracker.update_meter("fgd", "val", fgd)
+        gt_fgd = data_tools.FIDCalculator.frechet_distance(latent_ori_all, latent_ori_all)
+        logger.info(f"gt fgd score: {gt_fgd}")
+        self.tracker.update_meter("gt_fgd", "val", gt_fgd)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        align_denom = total_length - 2 * num_sequences * self.align_mask
+        align_avg = align / align_denom
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
+        align_gt_avg = align_gt / align_denom
+        logger.info(f"gt align score: {align_gt_avg}")
+        self.tracker.update_meter("gt_bc", "val", align_gt_avg)
 
         l1div = self.l1_calculator.avg()
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
+        logger.info(f"gt l1div score: {gt_l1div}")
+        self.tracker.update_meter("gt_l1div", "val", gt_l1div)
+        for metric_name in SKATING_METRIC_NAMES:
+            logger.info(f"{metric_name} score: {skating_metrics[metric_name]}")
+            self.tracker.update_meter(metric_name, "val", skating_metrics[metric_name])
+            gt_metric_name = f"gt_{metric_name}"
+            logger.info(f"{gt_metric_name} score: {gt_skating_metrics[gt_metric_name]}")
+            self.tracker.update_meter(
+                gt_metric_name, "val", gt_skating_metrics[gt_metric_name]
+            )
 
         self.val_recording(epoch)
 
@@ -949,9 +1066,14 @@ class CustomTrainer(BaseTrainer):
         )
 
         total_length = results_test["total_length"]
+        num_sequences = results_test["num_sequences"]
         align = results_test["align"]
+        align_gt = results_test["align_gt"]
         latent_out = results_test["latent_out"]
         latent_ori = results_test["latent_ori"]
+        gt_l1div = results_test["gt_l1div"]
+        skating_metrics = results_test["skating_metrics"]
+        gt_skating_metrics = results_test["gt_skating_metrics"]
 
         latent_out_all = np.concatenate(latent_out, axis=0)
         latent_ori_all = np.concatenate(latent_ori, axis=0)
@@ -959,14 +1081,31 @@ class CustomTrainer(BaseTrainer):
         fgd = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"fgd score: {fgd}")
         self.tracker.update_meter("fgd", "val", fgd)
+        gt_fgd = data_tools.FIDCalculator.frechet_distance(latent_ori_all, latent_ori_all)
+        logger.info(f"gt fgd score: {gt_fgd}")
+        self.tracker.update_meter("gt_fgd", "val", gt_fgd)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        align_denom = total_length - 2 * num_sequences * self.align_mask
+        align_avg = align / align_denom
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
+        align_gt_avg = align_gt / align_denom
+        logger.info(f"gt align score: {align_gt_avg}")
+        self.tracker.update_meter("gt_bc", "val", align_gt_avg)
 
         l1div = self.l1_calculator.avg()
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
+        logger.info(f"gt l1div score: {gt_l1div}")
+        self.tracker.update_meter("gt_l1div", "val", gt_l1div)
+        for metric_name in SKATING_METRIC_NAMES:
+            logger.info(f"{metric_name} score: {skating_metrics[metric_name]}")
+            self.tracker.update_meter(metric_name, "val", skating_metrics[metric_name])
+            gt_metric_name = f"gt_{metric_name}"
+            logger.info(f"{gt_metric_name} score: {gt_skating_metrics[gt_metric_name]}")
+            self.tracker.update_meter(
+                gt_metric_name, "val", gt_skating_metrics[gt_metric_name]
+            )
 
         self.val_recording(epoch)
 
@@ -984,11 +1123,16 @@ class CustomTrainer(BaseTrainer):
         )
 
         total_length = results["total_length"]
+        num_sequences = results["num_sequences"]
         align = results["align"]
+        align_gt = results["align_gt"]
         latent_out = results["latent_out"]
         latent_ori = results["latent_ori"]
         l2_all = results["l2_all"]
         lvel = results["lvel"]
+        gt_l1div = results["gt_l1div"]
+        skating_metrics = results["skating_metrics"]
+        gt_skating_metrics = results["gt_skating_metrics"]
         start_time = results["start_time"]
 
         logger.info(f"l2 loss: {l2_all/total_length:.10f}")
@@ -999,14 +1143,31 @@ class CustomTrainer(BaseTrainer):
         fgd = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"fgd score: {fgd}")
         self.test_recording("fgd", fgd, epoch)
+        gt_fgd = data_tools.FIDCalculator.frechet_distance(latent_ori_all, latent_ori_all)
+        logger.info(f"gt fgd score: {gt_fgd}")
+        self.test_recording("gt_fgd", gt_fgd, epoch)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        align_denom = total_length - 2 * num_sequences * self.align_mask
+        align_avg = align / align_denom
         logger.info(f"align score: {align_avg}")
         self.test_recording("bc", align_avg, epoch)
+        align_gt_avg = align_gt / align_denom
+        logger.info(f"gt align score: {align_gt_avg}")
+        self.test_recording("gt_bc", align_gt_avg, epoch)
 
         l1div = self.l1_calculator.avg()
         logger.info(f"l1div score: {l1div}")
         self.test_recording("l1div", l1div, epoch)
+        logger.info(f"gt l1div score: {gt_l1div}")
+        self.test_recording("gt_l1div", gt_l1div, epoch)
+        for metric_name in SKATING_METRIC_NAMES:
+            logger.info(f"{metric_name} score: {skating_metrics[metric_name]}")
+            self.test_recording(metric_name, skating_metrics[metric_name], epoch)
+            gt_metric_name = f"gt_{metric_name}"
+            logger.info(f"{gt_metric_name} score: {gt_skating_metrics[gt_metric_name]}")
+            self.test_recording(
+                gt_metric_name, gt_skating_metrics[gt_metric_name], epoch
+            )
 
         end_time = time.time() - start_time
         logger.info(
