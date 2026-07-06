@@ -38,6 +38,16 @@ _my_parser.add_argument("--config", "-c", default=None,
                         help="Advanced override for the generation config.")
 _my_parser.add_argument("--control_json", default=None,
                         help="Optional sparse joint control JSON for diffusion mode.")
+_my_parser.add_argument("--control_joint",
+                        choices=("left_wrist", "right_wrist", "head", "pelvis"),
+                        default="left_wrist",
+                        help="GT joint to use for automatic control when --control_json is omitted.")
+_my_parser.add_argument("--control_timing",
+                        choices=("end", "chunk_end"),
+                        default="end",
+                        help="Automatic GT control timing: final generated frame or every chunk end.")
+_my_parser.add_argument("--disable_auto_control", action="store_true",
+                        help="Disable automatic GT control when --control_json is omitted.")
 _my_parser.add_argument("--guidance_iters_early", type=int, default=5)
 _my_parser.add_argument("--guidance_iters_late", type=int, default=30)
 _my_parser.add_argument("--guidance_late_start", type=int, default=300,
@@ -605,18 +615,40 @@ def expected_generated_frames(n_frames, args):
     return n_frames - ((n_frames - seed_frames) % round_l)
 
 
-def build_gt_pelvis_entries(gt_joints, max_frame):
-    joint = 20 # Pelvis, left_wrist_joint = 20
-    frame = min(max_frame, gt_joints.shape[0]) - 1
-    if frame < 0:
+CONTROL_JOINTS = {
+    "head": 15,
+    "left_wrist": 20,
+    "right_wrist": 21,
+    "pelvis": 0,
+}
+
+
+def build_gt_control_entries(gt_joints, max_frame, args, control_joint, control_timing):
+    joint = CONTROL_JOINTS[control_joint]
+    last_frame = min(max_frame, gt_joints.shape[0]) - 1
+    if last_frame < 0:
         return []
-    xyz = gt_joints[frame, joint].copy()
-    # xyz[0] += 1.0
-    return [{
-        "frame": int(frame),
-        "joint": joint,
-        "xyz": xyz.tolist(),
-    }]
+
+    if control_timing == "end":
+        frames = [last_frame]
+    elif control_timing == "chunk_end":
+        seed_frames = args.pre_frames * args.vqvae_squeeze_scale
+        round_l = args.pose_length - seed_frames
+        frames = list(range(args.pose_length - 1, last_frame + 1, round_l))
+        if not frames or frames[-1] != last_frame:
+            frames.append(last_frame)
+    else:
+        raise ValueError(f"Unknown control_timing: {control_timing}")
+
+    entries = []
+    for frame in frames:
+        xyz = gt_joints[frame, joint].copy()
+        entries.append({
+            "frame": int(frame),
+            "joint": int(joint),
+            "xyz": xyz.tolist(),
+        })
+    return entries
 
 
 @logger.catch
@@ -655,10 +687,19 @@ def main():
     gt_betas = torch.from_numpy(gt["betas"]).float().to(DEVICE)
     gt_joints = smplx_to_joints(trainer.smplx, gt_pose_aa, gt_trans, gt_betas)
 
-    if not control_entries:
+    if not control_entries and not _my_args.disable_auto_control:
         generated_len = expected_generated_frames(gt_joints.shape[0], args)
-        control_entries = build_gt_pelvis_entries(gt_joints, generated_len)
-        logger.info(f"Using sparse GT pelvis control points: {len(control_entries)} keyframes")
+        control_entries = build_gt_control_entries(
+            gt_joints,
+            generated_len,
+            args,
+            _my_args.control_joint,
+            _my_args.control_timing,
+        )
+        logger.info(
+            f"Using sparse GT {_my_args.control_joint} control points "
+            f"({_my_args.control_timing}): {len(control_entries)} keyframes"
+        )
     trainer.control_entries = control_entries if _my_args.mode == "diffusion" else []
 
     # ---- Generation ----

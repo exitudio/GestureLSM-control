@@ -81,9 +81,13 @@ class CustomDataset(Dataset):
     def _process_split_rules(self):
         """Process dataset split rules."""
         split_rule = pd.read_csv(self.args.data_path+"train_test_split.csv")
+        speakers = self.args.training_speakers
+        if self.loader_type == "test" and hasattr(self.args, "test_speakers") and self.args.test_speakers is not None:
+            speakers = self.args.test_speakers
+
         self.selected_file = split_rule.loc[
             (split_rule['type'] == self.loader_type) & 
-            (split_rule['id'].str.split("_").str[0].astype(int).isin(self.args.training_speakers))
+            (split_rule['id'].str.split("_").str[0].astype(int).isin(speakers))
         ]
         
         if self.args.additional_data and self.loader_type == 'train':
@@ -104,6 +108,9 @@ class CustomDataset(Dataset):
     def _init_data_paths(self):
         """Initialize data directories and lengths."""
         self.data_dir = self.args.data_path
+        cache_path = self.args.cache_path
+        if self.loader_type == "test" and hasattr(self.args, "test_cache_path") and self.args.test_cache_path is not None:
+            cache_path = self.args.test_cache_path
         
         if self.loader_type == "test":
             self.args.multi_length_training = [1.0]
@@ -115,9 +122,9 @@ class CustomDataset(Dataset):
             self.max_audio_pre_len = self.args.test_length * self.args.audio_sr
         
         if self.args.test_clip and self.loader_type == "test":
-            self.preloaded_dir = self.args.root_path + self.args.cache_path + self.loader_type + "_clip" + f"/{self.args.pose_rep}_cache"
+            self.preloaded_dir = self.args.root_path + cache_path + self.loader_type + "_clip" + f"/{self.args.pose_rep}_cache"
         else:
-            self.preloaded_dir = self.args.root_path + self.args.cache_path + self.loader_type + f"/{self.args.pose_rep}_cache"
+            self.preloaded_dir = self.args.root_path + cache_path + self.loader_type + f"/{self.args.pose_rep}_cache"
     
     def _init_cache(self, build_cache):
         """Initialize or build cache."""

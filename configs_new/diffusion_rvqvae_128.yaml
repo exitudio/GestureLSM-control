@@ -134,6 +134,24 @@ validation:
   val_loss_steps: 200
   validation_steps: 1000
 
+control_eval:
+  enabled: False
+  joints:
+    - [head]
+    - [left_wrist]
+    - [right_wrist]
+    - [head, left_wrist, right_wrist]
+  densities: [1, 2, 5, 50, 100]
+  threshold_m: 0.5
+  seed: 42
+  iters_early: 5
+  iters_late: 30
+  late_start: 300
+  scale: 20.0
+  weight: 1.0
+  log_every: 0
+  freeze_root: True
+
 solver:
   opt: 'adam'
   epochs: 1000

@@ -121,6 +121,65 @@ def calculate_skating_ratio(
     return metrics[f"ratio_{int(thresh_vel * 100):03d}"], skate_vel
 
 
+def calculate_control_error_metrics(
+    motions,
+    hint,
+    mask,
+    threshold_m=0.5,
+):
+    if hasattr(motions, "detach"):
+        motions = motions.detach().cpu().numpy()
+    if hasattr(hint, "detach"):
+        hint = hint.detach().cpu().numpy()
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+
+    motions = np.asarray(motions)
+    hint = np.asarray(hint)
+    mask = np.asarray(mask).astype(bool)
+    if motions.ndim != 4 or motions.shape[-1] != 3:
+        raise ValueError("motions must have shape [B, T, J, 3]")
+    if hint.shape != motions.shape:
+        raise ValueError("hint must have the same shape as motions")
+    if mask.shape == motions.shape[:-1]:
+        mask = mask[..., None]
+    if mask.shape != motions.shape[:-1] + (1,):
+        raise ValueError("mask must have shape [B, T, J] or [B, T, J, 1]")
+
+    active = mask[..., 0]
+    errors = np.linalg.norm((motions - hint) * mask, axis=-1)
+    sample_active = active.reshape(active.shape[0], -1)
+    error_flat = errors.reshape(errors.shape[0], -1)
+    active_count = sample_active.sum(axis=1)
+
+    traj_fail = np.zeros((motions.shape[0],), dtype=np.float32)
+    valid_sample = active_count > 0
+    if valid_sample.any():
+        traj_fail[valid_sample] = (
+            (error_flat[valid_sample] > threshold_m) & sample_active[valid_sample]
+        ).any(axis=1).astype(np.float32)
+
+    total_active = active.sum()
+    if total_active <= 0:
+        return {
+            "traj_err_50cm": 0.0,
+            "loc_err_50cm": 0.0,
+            "avg_err_cm": 0.0,
+            "active_points": 0,
+            "active_samples": 0,
+        }
+
+    loc_fail = ((errors > threshold_m) & active).sum() / total_active
+    avg_err_cm = errors[active].mean() * 100.0
+    return {
+        "traj_err_50cm": float(traj_fail[valid_sample].mean()) if valid_sample.any() else 0.0,
+        "loc_err_50cm": float(loc_fail),
+        "avg_err_cm": float(avg_err_cm),
+        "active_points": int(total_active),
+        "active_samples": int(valid_sample.sum()),
+    }
+
+
 class SRGR(object):
     def __init__(self, threshold=0.1, joints=47):
         self.threshold = threshold

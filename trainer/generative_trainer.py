@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from typing import Dict
+from datetime import datetime
 
 import librosa
 import numpy as np
@@ -51,6 +52,84 @@ SKATING_METRIC_MAP = (
 )
 SKATING_METRIC_NAMES = tuple(name for name, _ in SKATING_METRIC_MAP)
 GT_SKATING_METRIC_NAMES = tuple(f"gt_{name}" for name in SKATING_METRIC_NAMES)
+
+CONTROL_JOINT_GROUPS = {
+    "head": (15,),
+    "left_wrist": (20,),
+    "right_wrist": (21,),
+    "all": (15, 20, 21),
+}
+CONTROL_JOINT_NAMES = {
+    15: "head",
+    20: "left_wrist",
+    21: "right_wrist",
+}
+CONTROL_DENSITIES = (1, 2, 5, 50, 100)
+CONTROL_METRIC_NAMES = (
+    "fgd",
+    "gt_fgd",
+    "align",
+    "gt_align",
+    "l1div",
+    "gt_l1div",
+    "foot_skating_ratio",
+    "traj_err_50cm",
+    "loc_err_50cm",
+    "avg_err_cm",
+)
+
+
+def _control_cfg_value(cfg, name, default):
+    control_cfg = getattr(cfg, "control_eval", None)
+    if control_cfg is None or not hasattr(control_cfg, name):
+        return default
+    return getattr(control_cfg, name)
+
+
+def _normalize_control_joint_group(group):
+    if isinstance(group, str):
+        if group not in CONTROL_JOINT_GROUPS:
+            raise ValueError(f"Unknown control joint group: {group}")
+        return group, CONTROL_JOINT_GROUPS[group]
+
+    names = [str(name) for name in group]
+    if names == ["head", "left_wrist", "right_wrist"]:
+        return "all", CONTROL_JOINT_GROUPS["all"]
+    joints = []
+    for name in names:
+        if name not in CONTROL_JOINT_GROUPS or len(CONTROL_JOINT_GROUPS[name]) != 1:
+            raise ValueError(f"Unknown control joint name: {name}")
+        joints.append(CONTROL_JOINT_GROUPS[name][0])
+    return "_".join(names), tuple(joints)
+
+
+def _control_eval_settings_from_cfg(cfg):
+    groups = _control_cfg_value(
+        cfg,
+        "joints",
+        (("head",), ("left_wrist",), ("right_wrist",), ("head", "left_wrist", "right_wrist")),
+    )
+    densities = _control_cfg_value(cfg, "densities", CONTROL_DENSITIES)
+    settings = []
+    for group in groups:
+        group_name, joints = _normalize_control_joint_group(group)
+        for density in densities:
+            density = int(density)
+            settings.append({
+                "name": f"{group_name}/density_{density}",
+                "joint_group": group_name,
+                "joints": joints,
+                "density": density,
+            })
+    return settings
+
+
+def _control_eval_metric_names(settings):
+    return [
+        f"control/{setting['name']}/{metric_name}"
+        for setting in settings
+        for metric_name in CONTROL_METRIC_NAMES
+    ]
 
 
 class CustomTrainer(BaseTrainer):
@@ -104,16 +183,22 @@ class CustomTrainer(BaseTrainer):
                 ]
             ] = 1
 
+        self.control_eval_settings = _control_eval_settings_from_cfg(cfg)
+        self.control_eval_metric_names = _control_eval_metric_names(
+            self.control_eval_settings
+        )
         self.tracker = other_tools.EpochTracker(
             [
                 "fgd", "gt_fgd", "bc", "gt_bc", "l1div", "gt_l1div",
                 *SKATING_METRIC_NAMES, *GT_SKATING_METRIC_NAMES,
+                *self.control_eval_metric_names,
                 "predict_x0_loss", "test_clip_fgd",
             ],
             [
                 True, False, True, True, True, True,
                 *([False] * len(SKATING_METRIC_NAMES)),
                 *([False] * len(GT_SKATING_METRIC_NAMES)),
+                *([False] * len(self.control_eval_metric_names)),
                 True, True,
             ],
         )
@@ -348,7 +433,136 @@ class CustomTrainer(BaseTrainer):
         if mode == "train":
             return g_loss_final
 
-    def _g_test(self, loaded_data):
+    def _control_eval_enabled(self):
+        control_cfg = getattr(self.cfg, "control_eval", None)
+        return bool(control_cfg is not None and getattr(control_cfg, "enabled", False))
+
+    def _control_eval_threshold_m(self):
+        return float(_control_cfg_value(self.cfg, "threshold_m", 0.5))
+
+    def _axis_angle_to_smplx_joints(self, pose_aa, trans, beta, exps=None):
+        bs, n = pose_aa.shape[:2]
+        pose_flat = pose_aa.reshape(bs * n, self.joints * 3)
+        beta_flat = beta.reshape(bs * n, -1)
+        trans_flat = trans.reshape(bs * n, 3)
+        if exps is None:
+            exps_flat = torch.zeros(bs * n, 100, device=pose_aa.device, dtype=pose_aa.dtype)
+        else:
+            exps_flat = exps.reshape(bs * n, 100)
+        out = self.smplx(
+            betas=beta_flat,
+            transl=trans_flat,
+            expression=exps_flat,
+            jaw_pose=pose_flat[:, 66:69],
+            global_orient=pose_flat[:, :3],
+            body_pose=pose_flat[:, 3 : 21 * 3 + 3],
+            left_hand_pose=pose_flat[:, 25 * 3 : 40 * 3],
+            right_hand_pose=pose_flat[:, 40 * 3 : 55 * 3],
+            return_joints=True,
+            leye_pose=pose_flat[:, 69:72],
+            reye_pose=pose_flat[:, 72:75],
+        )
+        return out["joints"].reshape(bs, n, 127, 3)
+
+    def _lower_latents_to_trans(self, lower_latents):
+        rec_lower = self.vq_model_lower.decode_continuous(
+            lower_latents * self.cfg.vqvae_latent_scale
+        )
+        rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
+        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+        rec_trans[..., 1] = rec_trans_v[..., 1]
+        return rec_trans
+
+    def _latent_chunk_to_joints(self, latent, betas, freeze_root=True, trans_offset=None):
+        sample = latent.squeeze(2).permute(0, 2, 1)
+        rec_up = sample[..., :128] * self.cfg.vqvae_latent_scale
+        rec_hn = sample[..., 128:256] * self.cfg.vqvae_latent_scale
+        rec_lo = sample[..., 256:] * self.cfg.vqvae_latent_scale
+
+        rec_upper = self.vq_model_upper.decode_continuous(rec_up)
+        rec_hands = self.vq_model_hands.decode_continuous(rec_hn)
+        rec_lower = self.vq_model_lower.decode_continuous(rec_lo)
+
+        rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
+        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+        rec_trans[..., 1] = rec_trans_v[..., 1]
+        if trans_offset is not None:
+            rec_trans = rec_trans + trans_offset.to(
+                device=rec_trans.device,
+                dtype=rec_trans.dtype,
+            ).view(1, 1, 3)
+        rec_lower = rec_lower[..., :-3]
+
+        if freeze_root:
+            rec_trans = rec_trans.detach()
+
+        if getattr(self.cfg.data, "pose_norm", True):
+            rec_upper = rec_upper * self.std_upper + self.mean_upper
+            rec_hands = rec_hands * self.std_hands + self.mean_hands
+            rec_lower = rec_lower * self.std_lower + self.mean_lower
+
+        bs_l, n_l = rec_lower.shape[:2]
+        ru = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
+        ).reshape(bs_l * n_l, 13 * 3)
+        rh = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_hands.reshape(bs_l, n_l, 30, 6))
+        ).reshape(bs_l * n_l, 30 * 3)
+        rl = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_lower[..., :54].reshape(bs_l, n_l, 9, 6))
+        ).reshape(bs_l * n_l, 9 * 3)
+
+        total = bs_l * n_l
+        rec_pose = (
+            self.inverse_selection_tensor(ru, self.joint_mask_upper, total)
+            + self.inverse_selection_tensor(rl, self.joint_mask_lower, total)
+            + self.inverse_selection_tensor(rh, self.joint_mask_hands, total)
+        )
+        aa = rec_pose.reshape(total, 55, 3)
+        body_betas = (
+            betas[:, None, :]
+            .expand(bs_l, n_l, -1)
+            .reshape(total, -1)
+            .to(sample.device)
+            .float()
+        )
+        out = self.smplx(
+            betas=body_betas,
+            global_orient=aa[:, 0],
+            body_pose=aa[:, 1:22].reshape(total, 63),
+            jaw_pose=aa[:, 22],
+            leye_pose=aa[:, 23],
+            reye_pose=aa[:, 24],
+            left_hand_pose=aa[:, 25:40].reshape(total, 45),
+            right_hand_pose=aa[:, 40:55].reshape(total, 45),
+            transl=rec_trans.reshape(total, 3).float(),
+            expression=torch.zeros(total, 100, device=sample.device),
+            return_verts=False,
+        )
+        return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+
+    def _build_control_from_target(self, target_joints, setting, rng):
+        bs, n = target_joints.shape[:2]
+        hint = torch.zeros_like(target_joints[:, :, :55])
+        mask = torch.zeros(bs, n, 55, device=target_joints.device, dtype=target_joints.dtype)
+        density = int(setting["density"])
+        if density in (1, 2, 5):
+            frame_count = min(n, density)
+        else:
+            frame_count = min(n, int(n * density / 100))
+        if frame_count <= 0:
+            return None
+        for b in range(bs):
+            frames = np.asarray(rng.choice(n, frame_count, replace=False), dtype=np.int64)
+            frames.sort()
+            for joint in setting["joints"]:
+                hint[b, frames, joint] = target_joints[b, frames, joint]
+                mask[b, frames, joint] = 1.0
+        if mask.sum() <= 0:
+            return None
+        return {"hint": hint, "mask": mask}
+
+    def _g_test(self, loaded_data, control_setting=None, control_rng=None):
         self.model.eval()
         tar_beta = loaded_data["beta"]
         tar_pose = loaded_data["tar_pose"]
@@ -396,8 +610,25 @@ class CustomTrainer(BaseTrainer):
         round_l = self.cfg.pose_length - pre_frames_scaled
         round_audio = int(round_l / 3 * 5)
 
+        final_n = n - remain
+        control_full = None
+        if control_setting is not None:
+            if self.cfg.model.g_name != "GestureDiffusion":
+                raise ValueError("control_eval requires a GestureDiffusion model")
+            with torch.no_grad():
+                target_joints = self._axis_angle_to_smplx_joints(
+                    tar_pose[:, :final_n],
+                    tar_trans[:, :final_n],
+                    tar_beta[:, :final_n],
+                    tar_exps[:, :final_n],
+                )[:, :, :55]
+            control_full = self._build_control_from_target(
+                target_joints, control_setting, control_rng
+            )
+
         in_audio_onset_tmp = None
         in_word_tmp = None
+        chunk_trans_offset = torch.zeros(3, device=self.mean_upper.device)
         for i in range(0, roundt):
             if audio_onset is not None:
                 in_audio_onset_tmp = audio_onset[
@@ -437,6 +668,30 @@ class CustomTrainer(BaseTrainer):
             cond_["y"]["seed"] = in_seed_tmp
             cond_["y"]["style_feature"] = torch.zeros([bs, 512]).cuda()
 
+            if control_full is not None:
+                start = i * round_l
+                end = start + self.cfg.data.pose_length
+                chunk_hint = control_full["hint"][:, start:end].clone()
+                chunk_mask = control_full["mask"][:, start:end].clone()
+                if i > 0:
+                    chunk_mask[:, :pre_frames_scaled] = 0
+                if chunk_mask.sum() > 0:
+                    cond_["y"]["control"] = {
+                        "hint": chunk_hint,
+                        "mask": chunk_mask,
+                        "iters_early": int(_control_cfg_value(self.cfg, "iters_early", 5)),
+                        "iters_late": int(_control_cfg_value(self.cfg, "iters_late", 30)),
+                        "late_start": int(_control_cfg_value(self.cfg, "late_start", 300)),
+                        "scale": float(_control_cfg_value(self.cfg, "scale", 20.0)),
+                        "weight": float(_control_cfg_value(self.cfg, "weight", 1.0)),
+                        "log_every": int(_control_cfg_value(self.cfg, "log_every", 0)),
+                        "freeze_root": bool(_control_cfg_value(self.cfg, "freeze_root", True)),
+                    }
+                    cond_["y"]["guidance_fn"] = (
+                        lambda x, freeze_root=True, betas=tar_beta[:, 0], trans_offset=chunk_trans_offset:
+                        self._latent_chunk_to_joints(x, betas, freeze_root, trans_offset)
+                    )
+
             sample = self.model(cond_)["latents"]
 
             sample = sample.squeeze(2).permute(0, 2, 1)
@@ -457,13 +712,21 @@ class CustomTrainer(BaseTrainer):
                 rec_all_hands.append(rec_latent_hands[:, self.cfg.pre_frames :])
                 rec_all_lower.append(rec_latent_lower[:, self.cfg.pre_frames :])
 
+            if control_full is not None and i + 1 < roundt:
+                next_start = (i + 1) * round_l
+                lower_so_far = torch.cat(rec_all_lower, dim=1)
+                with torch.no_grad():
+                    trans_so_far = self._lower_latents_to_trans(lower_so_far)
+                    chunk_trans_offset = trans_so_far[:, next_start - 1].detach()[0]
+                    chunk_trans_offset[1] = 0
+
         rec_all_upper = torch.cat(rec_all_upper, dim=1) * 5
         rec_all_hands = torch.cat(rec_all_hands, dim=1) * 5
         rec_all_lower = torch.cat(rec_all_lower, dim=1) * 5
 
-        rec_upper = self.vq_model_upper.latent2origin(rec_all_upper)[0]
-        rec_hands = self.vq_model_hands.latent2origin(rec_all_hands)[0]
-        rec_lower = self.vq_model_lower.latent2origin(rec_all_lower)[0]
+        rec_upper = self.vq_model_upper.decode_continuous(rec_all_upper)
+        rec_hands = self.vq_model_hands.decode_continuous(rec_all_hands)
+        rec_lower = self.vq_model_lower.decode_continuous(rec_all_lower)
 
         rec_trans_v = rec_lower[..., -3:]
         rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
@@ -526,6 +789,9 @@ class CustomTrainer(BaseTrainer):
             "tar_exps": tar_exps,
             "tar_beta": tar_beta,
             "tar_trans": tar_trans,
+            "control_hint": control_full["hint"] if control_full is not None else None,
+            "control_mask": control_full["mask"] if control_full is not None else None,
+            "control_setting": control_setting,
         }
 
     def train(self, epoch):
@@ -562,7 +828,14 @@ class CustomTrainer(BaseTrainer):
 
     @torch.no_grad()
     def _common_test_inference(
-        self, data_loader, epoch, mode="val", max_iterations=None, save_results=False
+        self,
+        data_loader,
+        epoch,
+        mode="val",
+        max_iterations=None,
+        save_results=False,
+        control_setting=None,
+        control_rng=None,
     ):
         """
         Common inference logic shared by val, test, test_clip, and test_render methods.
@@ -589,6 +862,8 @@ class CustomTrainer(BaseTrainer):
         skating_metrics_sum = {name: 0.0 for name in SKATING_METRIC_NAMES}
         gt_skating_metrics_sum = {name: 0.0 for name in SKATING_METRIC_NAMES}
         skating_count = 0
+        control_metric_sums = {name: 0.0 for name in CONTROL_METRIC_NAMES}
+        control_metric_counts = {name: 0 for name in CONTROL_METRIC_NAMES}
         num_sequences = 0
         l1_calculator_gt = metric.L1div()
         if hasattr(self, "l1_calculator"):
@@ -613,7 +888,7 @@ class CustomTrainer(BaseTrainer):
 
         with torch.no_grad():
             iterator = enumerate(data_loader)
-            if mode in ["test_clip", "test"]:
+            if mode in ["test_clip", "test", "control_eval"]:
                 iterator = enumerate(
                     tqdm(data_loader, desc=f"Testing {mode}", leave=True)
                 )
@@ -623,7 +898,11 @@ class CustomTrainer(BaseTrainer):
                     break
 
                 loaded_data = self._load_data(batch_data)
-                net_out = self._g_test(loaded_data)
+                net_out = self._g_test(
+                    loaded_data,
+                    control_setting=control_setting,
+                    control_rng=control_rng,
+                )
 
                 tar_pose = net_out["tar_pose"]
                 rec_pose = net_out["rec_pose"]
@@ -752,6 +1031,30 @@ class CustomTrainer(BaseTrainer):
                             np.sum(gt_skating_metrics[source_name])
                         )
                     skating_count += skating_metrics["ratio_050"].shape[0]
+
+                    control_hint = net_out.get("control_hint")
+                    control_mask = net_out.get("control_mask")
+                    if control_hint is not None and control_mask is not None:
+                        gen_global_joints = joints_rec_all + rec_trans_np[:, :, None, :]
+                        control_metrics = metric.calculate_control_error_metrics(
+                            gen_global_joints,
+                            control_hint.detach().cpu().numpy(),
+                            control_mask.detach().cpu().numpy(),
+                            threshold_m=self._control_eval_threshold_m(),
+                        )
+                        active_samples = int(control_metrics["active_samples"])
+                        active_points = int(control_metrics["active_points"])
+                        if active_samples > 0:
+                            control_metric_sums["traj_err_50cm"] += (
+                                control_metrics["traj_err_50cm"] * active_samples
+                            )
+                            control_metric_counts["traj_err_50cm"] += active_samples
+                        if active_points > 0:
+                            for metric_name in ("loc_err_50cm", "avg_err_cm"):
+                                control_metric_sums[metric_name] += (
+                                    control_metrics[metric_name] * active_points
+                                )
+                                control_metric_counts[metric_name] += active_points
 
                 # Calculate alignment for single batch
                 if (
@@ -955,6 +1258,13 @@ class CustomTrainer(BaseTrainer):
             for name in SKATING_METRIC_NAMES
         }
 
+        control_metrics_avg = {
+            name: control_metric_sums[name] / control_metric_counts[name]
+            if control_metric_counts[name] > 0 else 0.0
+            for name in CONTROL_METRIC_NAMES
+        }
+        control_metrics_avg["active_samples"] = control_metric_counts["traj_err_50cm"]
+
         return {
             "total_length": total_length,
             "num_sequences": num_sequences,
@@ -967,6 +1277,7 @@ class CustomTrainer(BaseTrainer):
             "gt_l1div": l1_calculator_gt.avg() if l1_calculator_gt.counter > 0 else 0.0,
             "skating_metrics": skating_metrics_avg,
             "gt_skating_metrics": gt_skating_metrics_avg,
+            "control_metrics": control_metrics_avg,
             "start_time": start_time,
         }
 
@@ -1114,7 +1425,114 @@ class CustomTrainer(BaseTrainer):
             f"total inference time: {int(end_time)} s for {int(total_length/self.cfg.data.pose_fps)} s motion"
         )
 
+    def _run_control_evaluation(self, epoch):
+        if not self._control_eval_enabled():
+            return
+        if self.cfg.model.g_name != "GestureDiffusion":
+            raise ValueError("control_eval.enabled=True requires GestureDiffusion")
+
+        seed = int(_control_cfg_value(self.cfg, "seed", 42))
+        max_iterations = None
+        if getattr(self.cfg, "debug", False):
+            max_iterations = 0
+
+        control_log_sink = None
+        if self.rank == 0:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            control_log_path = os.path.join(
+                self.checkpoint_path,
+                f"control_eval_{timestamp}_{os.getpid()}.txt",
+            )
+            control_log_sink = logger.add(
+                control_log_path,
+                format="<blue>{time: MM-DD HH:mm:ss}</blue> | <level>{message}</level>",
+            )
+            logger.info(f"Control eval log: {control_log_path}")
+
+        group_summaries = []
+        seen_groups = set()
+        for setting in self.control_eval_settings:
+            group_name = setting["joint_group"]
+            if group_name in seen_groups:
+                continue
+            seen_groups.add(group_name)
+            group_summaries.append(f"{group_name}={list(setting['joints'])}")
+
+        logger.info("Control eval configuration:")
+        logger.info(f"joint combinations: {group_summaries}")
+        logger.info(
+            f"densities: {list(_control_cfg_value(self.cfg, 'densities', CONTROL_DENSITIES))}"
+        )
+        logger.info(
+            f"iters_early: {int(_control_cfg_value(self.cfg, 'iters_early', 5))}"
+        )
+        logger.info(
+            f"iters_late: {int(_control_cfg_value(self.cfg, 'iters_late', 30))}"
+        )
+        logger.info(
+            f"late_start: {int(_control_cfg_value(self.cfg, 'late_start', 300))}"
+        )
+        logger.info(
+            f"freeze_root: {bool(_control_cfg_value(self.cfg, 'freeze_root', True))}"
+        )
+
+        try:
+            for setting_idx, setting in enumerate(self.control_eval_settings):
+                logger.info(
+                    "Control eval setting: "
+                    f"{setting['name']} joints={list(setting['joints'])}"
+                )
+                rng = np.random.default_rng(seed + setting_idx)
+                results = self._common_test_inference(
+                    self.test_loader,
+                    epoch,
+                    mode="control_eval",
+                    max_iterations=max_iterations,
+                    control_setting=setting,
+                    control_rng=rng,
+                )
+                control_metrics = results["control_metrics"]
+                total_length = results["total_length"]
+                num_sequences = results["num_sequences"]
+                latent_out_all = np.concatenate(results["latent_out"], axis=0)
+                latent_ori_all = np.concatenate(results["latent_ori"], axis=0)
+                fgd = data_tools.FIDCalculator.frechet_distance(
+                    latent_out_all, latent_ori_all
+                )
+                gt_fgd = data_tools.FIDCalculator.frechet_distance(
+                    latent_ori_all, latent_ori_all
+                )
+                align_denom = total_length - 2 * num_sequences * self.align_mask
+                align_avg = results["align"] / align_denom
+                gt_align_avg = results["align_gt"] / align_denom
+                metric_values = {
+                    "fgd": fgd,
+                    "gt_fgd": gt_fgd,
+                    "align": align_avg,
+                    "gt_align": gt_align_avg,
+                    "l1div": self.l1_calculator.avg(),
+                    "gt_l1div": results["gt_l1div"],
+                    "foot_skating_ratio": results["skating_metrics"]["skating_ratio"],
+                    "traj_err_50cm": control_metrics["traj_err_50cm"],
+                    "loc_err_50cm": control_metrics["loc_err_50cm"],
+                    "avg_err_cm": control_metrics["avg_err_cm"],
+                }
+                for metric_name, value in metric_values.items():
+                    tracker_name = f"control/{setting['name']}/{metric_name}"
+                    logger.info(f"{tracker_name}: {value}")
+                    self.test_recording(tracker_name, value, epoch)
+        finally:
+            if control_log_sink is not None:
+                logger.remove(control_log_sink)
+
     def test(self, epoch):
+        if self._control_eval_enabled():
+            start_time = time.time()
+            self._run_control_evaluation(epoch)
+            end_time = time.time() - start_time
+            logger.info(f"total control eval time: {int(end_time)} s")
+            return
+
         results_save_path = self.checkpoint_path + f"/{epoch}/"
         os.makedirs(results_save_path, exist_ok=True)
 
@@ -1168,6 +1586,8 @@ class CustomTrainer(BaseTrainer):
             self.test_recording(
                 gt_metric_name, gt_skating_metrics[gt_metric_name], epoch
             )
+
+        self._run_control_evaluation(epoch)
 
         end_time = time.time() - start_time
         logger.info(

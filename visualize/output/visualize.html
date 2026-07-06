@@ -449,9 +449,30 @@ function startViewer(genRaw, gtRaw, audioFile, controlRaw=[]) {
   const pad = 0.3; mnX-=pad; mxX+=pad; mnY-=pad; mxY+=pad; mnZ-=pad; mxZ+=pad;
   const span = Math.max(mxX-mnX, mxY-mnY, mxZ-mnZ);
 
+  const sortedControls = controls.slice().sort((a, b) => (a.joint - b.joint) || (a.frame - b.frame));
   const controlsAtFrame = (idx) => {
-    const pts = controls.filter(c => c.frame === idx).map(c => c.point);
-    return [pts.map(p => p[0]), pts.map(p => p[1]), pts.map(p => p[2])];
+    const pts = [];
+    const colors = [];
+    const sizes = [];
+    for (let i = 0; i < sortedControls.length; i++) {
+      const c = sortedControls[i];
+      let prevFrame = -1;
+      for (let j = i - 1; j >= 0; j--) {
+        if (sortedControls[j].joint === c.joint) {
+          prevFrame = sortedControls[j].frame;
+          break;
+        }
+      }
+      const startFrame = Math.max(0, prevFrame + 1);
+      if (idx < startFrame || idx > c.frame) continue;
+      const span = Math.max(1, c.frame - startFrame);
+      const progress = Math.max(0, Math.min(1, (idx - startFrame) / span));
+      const opacity = 0.12 + 0.88 * progress;
+      pts.push(c.point);
+      colors.push(`rgba(255,0,255,${opacity.toFixed(3)})`);
+      sizes.push(5 + 5 * progress);
+    }
+    return [pts.map(p => p[0]), pts.map(p => p[1]), pts.map(p => p[2]), colors, sizes];
   };
   const control0 = controlsAtFrame(0);
   const initial = [
@@ -464,7 +485,7 @@ function startViewer(genRaw, gtRaw, audioFile, controlRaw=[]) {
     { x: gtX[0], y: gtY[0], z: gtZ[0], mode: "markers", type: "scatter3d",
       marker: { size: 2.5, color: "darkorange" }, name: "gt joints" },
     { x: control0[0], y: control0[1], z: control0[2], mode: "markers", type: "scatter3d",
-      marker: { size: 8, color: "magenta", symbol: "diamond" }, name: "control points", visible: controls.length > 0 },
+      marker: { size: control0[4], color: control0[3], symbol: "diamond" }, name: "control points", visible: controls.length > 0 },
   ];
   const layout = {
     scene: {
@@ -497,6 +518,10 @@ function startViewer(genRaw, gtRaw, audioFile, controlRaw=[]) {
       y: [genBones[idx][1], genY[idx], gtBones[idx][1], gtY[idx], controlFrame[1]],
       z: [genBones[idx][2], genZ[idx], gtBones[idx][2], gtZ[idx], controlFrame[2]],
     }, [0, 1, 2, 3, 4]);
+    Plotly.restyle("plot", {
+      "marker.color": [controlFrame[3]],
+      "marker.size": [controlFrame[4]],
+    }, [4]);
     slider.value = idx;
     frameLbl.textContent = `frame ${idx} / ${N-1}`;
   }
