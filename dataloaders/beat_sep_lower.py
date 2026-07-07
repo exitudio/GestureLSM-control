@@ -18,6 +18,7 @@ import pickle
 import smplx
 from .utils.audio_features import process_audio_data
 from .data_tools import joints_list
+from .numpy_pickle_compat import install_numpy_core_aliases
 from .utils.other_tools import MultiLMDBManager
 from .utils.motion_rep_transfer import process_smplx_motion
 from .utils.mis_features import process_semantic_data, process_emotion_data
@@ -25,6 +26,8 @@ from .utils.text_features import process_word_data
 from .utils.data_sample import sample_from_clip
 import time
 
+
+install_numpy_core_aliases()
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):

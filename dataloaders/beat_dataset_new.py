@@ -23,6 +23,9 @@ from .utils.mis_features import process_semantic_data, process_emotion_data
 from .utils.text_features import process_word_data
 from .utils.data_sample import sample_from_clip
 from .utils import rotation_conversions as rc
+from .numpy_pickle_compat import install_numpy_core_aliases
+
+install_numpy_core_aliases()
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, build_cache=True):

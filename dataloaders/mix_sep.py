@@ -21,11 +21,14 @@ import smplx
 import glob
 
 from .build_vocab import Vocab
+from .numpy_pickle_compat import install_numpy_core_aliases
 # from .utils.audio_features import Wav2Vec2Model
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
 from .utils import other_tools
 
+
+install_numpy_core_aliases()
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):
