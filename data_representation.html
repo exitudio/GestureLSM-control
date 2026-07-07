@@ -39,6 +39,14 @@
   .tcard .big { font-size:30px; font-weight:700; font-variant-numeric:tabular-nums; }
   .tcard p { font-size:13px; margin:8px 0 0; color:#cbd5e1; }
   .tcard .tag { display:inline-block; font-size:11px; font-weight:600; color:#fff; padding:2px 9px; border-radius:999px; margin-top:6px; }
+  .split { display:grid; gap:7px; margin:10px 0 2px; }
+  .split-row { border:1px solid; border-radius:8px; padding:8px 10px; font-size:12.5px; line-height:1.35; }
+  .split-row strong { display:block; color:#fff; font-size:12px; margin-bottom:2px; }
+  .split-row span { color:#dbeafe; }
+  .rot-global { background:rgba(20,184,166,.24); border-color:rgba(20,184,166,.62); }
+  .rot-local { background:rgba(37,99,235,.22); border-color:rgba(37,99,235,.58); }
+  .trans-relative { background:rgba(245,158,11,.24); border-color:rgba(245,158,11,.66); }
+  .trans-global { background:rgba(234,88,12,.22); border-color:rgba(234,88,12,.58); }
 
   /* proportion bar */
   .dimbar { display:flex; width:100%; height:44px; border-radius:8px; overflow:hidden; border:1px solid var(--panel2); margin-top:6px; }
@@ -79,20 +87,28 @@
     <div class="tcard" style="border-top-color:var(--rot)">
       <div class="ico">🔄</div>
       <h3>Rotation</h3>
-      <div class="dims">joint orientations · <b>6D rotation</b></div>
+      <div class="dims">6D rotation · <b>global vs parent-relative</b></div>
       <div class="big" style="color:var(--rot)">330</div>
       <div class="dims">= 55 joints × 6</div>
       <span class="tag" style="background:var(--rot)">indices 0–329</span>
-      <p>Local rotation of each SMPL-X joint relative to its parent. Stored as continuous 6D rotation (not Euler/axis-angle).</p>
+      <div class="split">
+        <div class="split-row rot-global"><strong>Root rotation</strong><span>global orientation per frame</span></div>
+        <div class="split-row rot-local"><strong>Joint rotations</strong><span>relative to parent joints</span></div>
+      </div>
+      <p>All rotations are stored as continuous 6D rotation. Joint 0/pelvis becomes SMPL-X <code>global_orient</code>.</p>
     </div>
     <div class="tcard" style="border-top-color:var(--trans)">
       <div class="ico">➡️</div>
       <h3>Translation</h3>
-      <div class="dims">root global motion · <b>velocity</b></div>
+      <div class="dims">root trajectory · <b>relative vs global</b></div>
       <div class="big" style="color:var(--trans)">3</div>
       <div class="dims">= Δx, Δz, height&nbsp;y</div>
       <span class="tag" style="background:var(--trans)">indices 330–332</span>
-      <p>How the whole body moves through space (root trajectory). x/z are per-frame velocity, y is absolute height (<code>trans_v</code>).</p>
+      <div class="split">
+        <div class="split-row trans-relative"><strong>x/z translation</strong><span>relative to previous frame</span></div>
+        <div class="split-row trans-global"><strong>y translation</strong><span>global root height per frame</span></div>
+      </div>
+      <p>x/z are integrated with cumulative sum to recover the global trajectory. y is used directly as absolute height.</p>
     </div>
     <div class="tcard" style="border-top-color:var(--expr)">
       <div class="ico">😀</div>
@@ -107,8 +123,8 @@
 
   <div class="note key" style="margin-top:18px">
     <b>Key point — there are NO 3D positions in the data.</b> Joints are stored as <b>rotations</b>, and the body as a whole as <b>translation</b>.
-    Actual 3D joint/vertex <b>positions</b> are computed only later by <b>forward kinematics</b> through the SMPL-X model
-    (rotations + translation + body shape → mesh). So the model learns angles &amp; motion, not coordinates.
+    Actual 3D joint/vertex <b>positions</b> are computed only later through the SMPL-X model
+    (decoded rotations + recovered root translation + body shape → mesh). So the model learns orientations and root motion, not joint coordinates.
   </div>
 
   <h2>2. Proportion of the 433-dim vector (by data type)</h2>
@@ -281,6 +297,10 @@
         <b>Note:</b> joints <b>22 jaw, 23 left_eye, 24 right_eye</b> (gray) are <b>not trained</b> in any rotation part
         (upper ends at joint 21, hands start at joint 25). Facial motion is captured by the <span style="color:var(--expr)">expression</span> data instead.
       </div>
+      <div class="note key">
+        <b>Root motion:</b> joint <b>0 pelvis</b> contributes the SMPL-X <code>global_orient</code>. It is decoded as a per-frame global root orientation,
+        not recovered by accumulating angular velocity. Previous latent tokens can affect it only through the VQ decoder's finite temporal context.
+      </div>
     </div>
   </div>
 
@@ -298,7 +318,26 @@
       <span class="arrow">→</span>
       <span class="box" style="border-color:#38bdf8">3D positions<br><small>via forward kinematics</small></span>
     </div>
+    <div class="note key">
+      <b>Global motion recovery:</b> decoded <code>trans_v[..., 0]</code> and <code>trans_v[..., 2]</code> are integrated with cumulative sum to form global x/z root trajectory.
+      Decoded <code>trans_v[..., 1]</code> is used directly as root height y. The decoded pelvis rotation becomes SMPL-X <code>global_orient</code> for each frame.
+    </div>
     <p style="margin-bottom:0"><small>Normalization: <code>mean_std/beatx_2_330_*.npy</code> (rotation) &amp; <code>beatx_2_trans_*.npy</code> (translation). Source: <code>mix_sep.py __getitem__</code> lines 278–300, parts in <code>rvq_beatx_train.py</code> 175–258.</small></p>
+  </div>
+
+  <h2>5. Decoder temporal field</h2>
+  <div class="panel">
+    <p style="margin-top:0">The VQ decoder is non-causal, so one latent token can affect decoded frames both before and after its nominal frame.</p>
+    <table>
+      <tr><th>Probe result</th><th>Frames</th><th>Meaning</th></tr>
+      <tr><td>Past affected</td><td class="num">87</td><td>Changing one middle latent token changes up to 87 earlier decoded frames.</td></tr>
+      <tr><td>Future affected</td><td class="num">90</td><td>The same latent token changes up to 90 later decoded frames.</td></tr>
+      <tr><td>Total affected</td><td class="num">178</td><td>The effective decoder field is larger than one 128-frame generation chunk.</td></tr>
+    </table>
+    <div class="note key">
+      <b>Control implication:</b> chunk-end guidance can report near-zero loss under chunk-local decoding, then move after full-sequence decoding because future latent tokens are inside the decoder field.
+      Prepending previous latents helps the left boundary, but exact chunk-end control also needs right/future context.
+    </div>
   </div>
 
 </div>

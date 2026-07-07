@@ -50,9 +50,11 @@ class BaseTrainer(object):
             "test_clip_fgd": {"value": float('inf'), "epoch": 0},
         }
               
+        dataloader_workers = int(getattr(cfg.data, "num_workers", 0))
+
         self.train_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, cfg.data, loader_type='train')
         self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_data)
-        self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=4)
+        self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=dataloader_workers)
         
         if cfg.data.test_clip:
             # test data for test_clip, only used for test_clip_fgd
