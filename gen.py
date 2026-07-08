@@ -54,6 +54,9 @@ _my_parser.add_argument("--guidance_late_start", type=int, default=300,
                         help="Diffusion timestep threshold for late guidance iterations.")
 _my_parser.add_argument("--guidance_scale_base", type=float, default=20.0)
 _my_parser.add_argument("--guidance_weight", type=float, default=1.0)
+_my_parser.add_argument("--guidance_chunk_delay", type=int, default=0,
+                        help="Delay chunk k by k*N DDIM waves during batched guided diffusion. "
+                             "Use 0 for the all-chunks-at-once schedule.")
 _my_parser.add_argument("--guidance_log_every", type=int, default=5,
                         help="Print guidance loss at this optimizer-step interval. Use 0 to disable.")
 _my_parser.add_argument("--guidance_freeze_root", type=lambda v: str(v).lower() not in ("0", "false", "no"),
@@ -369,6 +372,112 @@ class HTMLTrainer:
         )
         return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
 
+    def _stitch_chunk_latents(self, chunk_latents):
+        """Convert [chunks, 32, 384] overlapping chunks to one long latent sequence."""
+        if chunk_latents.shape[0] == 1:
+            return chunk_latents[:1]
+        parts = [chunk_latents[:1]]
+        parts.extend(
+            chunk_latents[i:i + 1, self.args.pre_frames:]
+            for i in range(1, chunk_latents.shape[0])
+        )
+        return torch.cat(parts, dim=1)
+
+    def _decode_full_latents(self, full_latents, freeze_root=False):
+        rec_up = full_latents[..., :128] * self.vqvae_latent_scale
+        rec_hn = full_latents[..., 128:256] * self.vqvae_latent_scale
+        rec_lo = full_latents[..., 256:] * self.vqvae_latent_scale
+
+        rec_upper = self.vq_model_upper.decode_continuous(rec_up)
+        rec_hands = self.vq_model_hands.decode_continuous(rec_hn)
+        rec_lower = self.vq_model_lower.decode_continuous(rec_lo)
+
+        if self.use_trans:
+            rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
+            rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+            rec_trans[..., 1] = rec_trans_v[..., 1]
+            rec_lower = rec_lower[..., :-3]
+        else:
+            rec_trans = torch.zeros(
+                (rec_upper.shape[0], rec_upper.shape[1], 3),
+                device=full_latents.device,
+                dtype=full_latents.dtype,
+            )
+
+        if freeze_root:
+            rec_trans = rec_trans.detach()
+
+        if self.args.pose_norm:
+            rec_upper = rec_upper * self.std_upper + self.mean_upper
+            rec_hands = rec_hands * self.std_hands + self.mean_hands
+            rec_lower = rec_lower * self.std_lower + self.mean_lower
+
+        return rec_upper, rec_hands, rec_lower, rec_trans
+
+    def _full_latents_to_joints(self, full_latents, betas, freeze_root=True):
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            full_latents,
+            freeze_root=freeze_root,
+        )
+
+        bs_l, n_l = rec_lower.shape[0], rec_lower.shape[1]
+        ru = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
+        ).reshape(bs_l * n_l, 13 * 3)
+        rh = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_hands.reshape(bs_l, n_l, 30, 6))
+        ).reshape(bs_l * n_l, 30 * 3)
+        rl = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_lower[..., :54].reshape(bs_l, n_l, 9, 6))
+        ).reshape(bs_l * n_l, 9 * 3)
+
+        N = bs_l * n_l
+        rec_pose = (self._inverse_selection(ru, self.joint_mask_upper, N)
+                    + self._inverse_selection(rl, self.joint_mask_lower, N)
+                    + self._inverse_selection(rh, self.joint_mask_hands, N))
+        aa = rec_pose.reshape(N, 55, 3)
+        body_betas = (
+            betas[:, None, :]
+            .expand(bs_l, n_l, -1)
+            .reshape(N, -1)
+            .to(full_latents.device)
+            .float()
+        )
+        out = self.smplx(
+            betas=body_betas,
+            global_orient=aa[:, 0],
+            body_pose=aa[:, 1:22].reshape(N, 63),
+            jaw_pose=aa[:, 22],
+            leye_pose=aa[:, 23],
+            reye_pose=aa[:, 24],
+            left_hand_pose=aa[:, 25:40].reshape(N, 45),
+            right_hand_pose=aa[:, 40:55].reshape(N, 45),
+            transl=rec_trans.reshape(N, 3).float(),
+            expression=torch.zeros(N, 100, device=full_latents.device),
+            return_verts=False,
+        )
+        return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+
+    def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
+        chunk_latents = latent.squeeze(2).permute(0, 2, 1)
+        full_latents = self._stitch_chunk_latents(chunk_latents)
+        full_joints = self._full_latents_to_joints(full_latents, betas, freeze_root)
+        windows = []
+        for i in range(chunk_latents.shape[0]):
+            start = i * round_l
+            end = start + self.args.pose_length
+            windows.append(full_joints[:, start:end])
+        return torch.cat(windows, dim=0)
+
+    def _update_dynamic_seeds(self, x0, first_seed):
+        chunk_latents = x0.squeeze(2).permute(0, 2, 1)
+        seeds = [first_seed]
+        seeds.extend(
+            chunk_latents[i - 1:i, -self.args.pre_frames:]
+            for i in range(1, chunk_latents.shape[0])
+        )
+        return torch.cat(seeds, dim=0)
+
     def _load_data(self, dict_data):
         tar_pose_raw = dict_data["pose"]
         tar_pose = tar_pose_raw[:, :, :165].to(self.rank)
@@ -421,7 +530,6 @@ class HTMLTrainer:
         """Mirror of demo.BaseTrainer._g_test — produces rec_pose / rec_trans."""
         a = self.args
         bs, n = loaded_data["tar_pose"].shape[0], loaded_data["tar_pose"].shape[1]
-        j = self.joints
         tar_pose = loaded_data["tar_pose"]
         tar_trans = loaded_data["tar_trans"]
         in_word = loaded_data["in_word"]
@@ -438,90 +546,101 @@ class HTMLTrainer:
             in_seed = in_seed[:, :in_x0.shape[1]]
             n -= remain
 
-        rec_up, rec_hn, rec_lo = [], [], []
         vsq = a.vqvae_squeeze_scale
         roundt = (n - a.pre_frames * vsq) // (a.pose_length - a.pre_frames * vsq)
         round_l = a.pose_length - a.pre_frames * vsq
-        last_sample = None
-        chunk_trans_offset = torch.zeros(3, device=self.mean_upper.device)
         control_full = self._build_control_tensors(n)
         betas = loaded_data["tar_beta"][:, 0]
 
-        for i in range(roundt):
-            iw = in_word[:, i * round_l:(i + 1) * round_l + a.pre_frames * vsq]
-            ia = in_audio[:, i * (16000 // 30 * round_l):
-                          (i + 1) * (16000 // 30 * round_l) + 16000 // 30 * a.pre_frames * vsq]
-            iid = loaded_data["tar_id"][:, i * round_l:(i + 1) * round_l + a.pre_frames]
-            ix0 = in_x0[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
-            iseed = in_seed[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
-            iseed = iseed[:, :a.pre_frames] if i == 0 else last_sample[:, -a.pre_frames:]
+        audio_chunks, word_chunks, id_chunks = [], [], []
+        seed_chunks = []
+        first_seed = in_seed[:, :a.pre_frames]
 
-            cond = {"y": {
-                "audio_onset": ia, "word": iw, "id": iid, "seed": iseed,
-                "mask": (torch.zeros([a.batch_size, 1, 1, a.pose_length]) < 1).cuda(),
-                "style_feature": torch.zeros([bs, 512]).cuda(),
-            }}
-            if control_full is not None:
+        for i in range(roundt):
+            audio_chunks.append(
+                in_audio[:, i * (16000 // 30 * round_l):
+                         (i + 1) * (16000 // 30 * round_l) + 16000 // 30 * a.pre_frames * vsq]
+            )
+            word_chunks.append(in_word[:, i * round_l:(i + 1) * round_l + a.pre_frames * vsq])
+            id_chunks.append(loaded_data["tar_id"][:, i * round_l:(i + 1) * round_l + a.pre_frames])
+            seed_chunks.append(torch.zeros_like(first_seed) if i > 0 else first_seed)
+
+        final_chunks = None
+        if control_full is not None and _my_args.mode == "diffusion":
+            hint_chunks, mask_chunks = [], []
+            for i in range(roundt):
                 start = i * round_l
                 end = start + a.pose_length
                 chunk_hint = control_full["hint"][start:end].clone()
                 chunk_mask = control_full["mask"][start:end].clone()
                 if i > 0:
                     chunk_mask[:a.pre_frames * vsq] = 0
-                if chunk_mask.sum() > 0:
-                    cond["y"]["control"] = {
-                        "hint": chunk_hint,
-                        "mask": chunk_mask,
+                hint_chunks.append(chunk_hint.unsqueeze(0))
+                mask_chunks.append(chunk_mask.unsqueeze(0))
+
+            hint_batch = torch.cat(hint_chunks, dim=0)
+            mask_batch = torch.cat(mask_chunks, dim=0)
+            if mask_batch.sum() > 0:
+                cond = {"y": {
+                    "audio_onset": torch.cat(audio_chunks, dim=0),
+                    "word": torch.cat(word_chunks, dim=0),
+                    "id": torch.cat(id_chunks, dim=0),
+                    "seed": torch.cat(seed_chunks, dim=0),
+                    "mask": (torch.zeros([roundt, 1, 1, a.pose_length], device=self.mean_upper.device) < 1),
+                    "style_feature": torch.zeros([roundt, 512], device=self.mean_upper.device),
+                    "control": {
+                        "hint": hint_batch,
+                        "mask": mask_batch,
                         "iters_early": _my_args.guidance_iters_early,
                         "iters_late": _my_args.guidance_iters_late,
                         "late_start": _my_args.guidance_late_start,
                         "scale": _my_args.guidance_scale_base,
                         "weight": _my_args.guidance_weight,
+                        "chunk_delay": _my_args.guidance_chunk_delay,
                         "log_every": _my_args.guidance_log_every,
                         "freeze_root": _my_args.guidance_freeze_root,
-                    }
-                    cond["y"]["guidance_fn"] = (
-                        lambda x, freeze_root=True, betas=betas, trans_offset=chunk_trans_offset:
-                        self._latent_chunk_to_joints(x, betas, freeze_root, trans_offset)
-                    )
-                    logger.info(f"Guidance active for chunk {i}: {int((chunk_mask > 0).sum().item())} keyframes")
-            sample = self.model(cond)["latents"].squeeze().permute(1, 0).unsqueeze(0)
-            last_sample = sample.clone()
-            ru, rh, rl = sample[..., :128], sample[..., 128:256], sample[..., 256:]
-            if i == 0:
-                rec_up.append(ru); rec_hn.append(rh); rec_lo.append(rl)
-            else:
-                rec_up.append(ru[:, a.pre_frames:])
-                rec_hn.append(rh[:, a.pre_frames:])
-                rec_lo.append(rl[:, a.pre_frames:])
+                    },
+                }}
+                cond["y"]["guidance_fn"] = (
+                    lambda x, freeze_root=True, betas=betas, round_l=round_l:
+                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l)
+                )
+                cond["y"]["seed_update_fn"] = (
+                    lambda x, seed, first_seed=first_seed:
+                    self._update_dynamic_seeds(x, first_seed)
+                )
+                logger.info(
+                    "Dynamic-seed global guidance active: "
+                    f"{roundt} chunks, {int((mask_batch > 0).sum().item())} keyframes, "
+                    f"chunk_delay={_my_args.guidance_chunk_delay}"
+                )
+                final_chunks = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
 
-            if self.use_trans and i + 1 < roundt:
-                next_start = (i + 1) * round_l
-                lower_so_far = torch.cat(rec_lo, dim=1)
-                with torch.no_grad():
-                    trans_so_far = self._lower_latents_to_trans(lower_so_far)
-                    chunk_trans_offset = trans_so_far[:, next_start - 1].detach().squeeze(0)
-                    chunk_trans_offset[1] = 0
+        if final_chunks is None:
+            rec_chunks = []
+            last_sample = None
+            for i in range(roundt):
+                iseed = in_seed[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
+                iseed = iseed[:, :a.pre_frames] if i == 0 else last_sample[:, -a.pre_frames:]
+                cond = {"y": {
+                    "audio_onset": audio_chunks[i],
+                    "word": word_chunks[i],
+                    "id": id_chunks[i],
+                    "seed": iseed,
+                    "mask": (torch.zeros([bs, 1, 1, a.pose_length], device=self.mean_upper.device) < 1),
+                    "style_feature": torch.zeros([bs, 512], device=self.mean_upper.device),
+                }}
+                sample = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
+                last_sample = sample.clone()
+                rec_chunks.append(sample)
+            final_chunks = torch.cat(rec_chunks, dim=0)
 
-        rec_up = torch.cat(rec_up, dim=1) * self.vqvae_latent_scale
-        rec_hn = torch.cat(rec_hn, dim=1) * self.vqvae_latent_scale
-        rec_lo = torch.cat(rec_lo, dim=1) * self.vqvae_latent_scale
-        rec_upper = self.vq_model_upper.decode_continuous(rec_up)
-        rec_hands = self.vq_model_hands.decode_continuous(rec_hn)
-        rec_lower = self.vq_model_lower.decode_continuous(rec_lo)
+        full_latents = self._stitch_chunk_latents(final_chunks)
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            full_latents,
+            freeze_root=False,
+        )
 
-        if self.use_trans:
-            rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
-            rec_trans = torch.cumsum(rec_trans_v, dim=-2)
-            rec_trans[..., 1] = rec_trans_v[..., 1]
-            rec_lower = rec_lower[..., :-3]
-
-        if a.pose_norm:
-            rec_upper = rec_upper * self.std_upper + self.mean_upper
-            rec_hands = rec_hands * self.std_hands + self.mean_hands
-            rec_lower = rec_lower * self.std_lower + self.mean_lower
-
-        # re-combine upper / hands / lower into 165-d axis-angle pose
         bs_l, n_l = rec_lower.shape[0], rec_lower.shape[1]
         ru = rc.matrix_to_axis_angle(
             rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
@@ -537,12 +656,11 @@ class HTMLTrainer:
         rec_pose = (self._inverse_selection(ru, self.joint_mask_upper, N)
                     + self._inverse_selection(rl, self.joint_mask_lower, N)
                     + self._inverse_selection(rh, self.joint_mask_hands, N))
-        # keep jaw from target
-        rec_pose[:, 66:69] = tar_pose.reshape(bs * n, 55 * 3)[:bs_l * n_l, 66:69]
+        rec_pose[:, 66:69] = tar_pose.reshape(bs * n, 55 * 3)[:N, 66:69]
 
         n = n - ((n - a.pre_frames * vsq) % (a.pose_length - a.pre_frames * vsq))
         return {
-            "rec_pose_aa": rec_pose.reshape(bs_l, n_l, 165),  # axis-angle [bs, n, 165]
+            "rec_pose_aa": rec_pose.reshape(bs_l, n_l, 165),
             "rec_trans": rec_trans,
             "tar_beta": loaded_data["tar_beta"][:, :n_l],
         }
@@ -767,4 +885,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
