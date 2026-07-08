@@ -49,14 +49,6 @@ class GestureDiffusion(torch.nn.Module):
         Returns:
             Guided output tensor
         """
-        batch_size = x.shape[0]
-        if timesteps.dim() == 0:
-            timesteps = timesteps.expand(batch_size)
-        elif timesteps.shape[0] != batch_size:
-            raise ValueError(
-                f"timesteps batch mismatch: got {timesteps.shape[0]}, expected {batch_size}"
-            )
-
         if guidance_scale <= 1.0:
             # No guidance needed, run normal forward pass
             return self.denoiser(
@@ -72,7 +64,10 @@ class GestureDiffusion(torch.nn.Module):
         x_doubled = torch.cat([x] * 2, dim=0)
         seed_doubled = torch.cat([seed] * 2, dim=0)
         at_feat_doubled = torch.cat([at_feat] * 2, dim=0)
-        timesteps_doubled = torch.cat([timesteps, timesteps], dim=0)
+        
+        # Properly expand timesteps to match doubled batch size
+        batch_size = x.shape[0]
+        timesteps_doubled = timesteps.expand(batch_size * 2)
         
         # Create conditional and unconditional audio features
         batch_size = at_feat.shape[0]
@@ -181,49 +176,36 @@ class GestureDiffusion(torch.nn.Module):
             mask = mask.unsqueeze(0)
 
         late_start = int(control.get("late_start", 300))
-        t_for_schedule = t.min() if t.dim() > 0 else t
-        n_iters = int(control.get("iters_late", 30) if int(t_for_schedule.item()) <= late_start else control.get("iters_early", 5))
+        n_iters = int(control.get("iters_late", 30) if int(t.item()) <= late_start else control.get("iters_early", 5))
         if n_iters <= 0:
             return x0
 
         active = torch.clamp((mask > 0).sum().to(dtype=x0.dtype), min=1.0)
-        lr = float(control.get("scale", 20.0)) / active.item()
+        scale = float(control.get("scale", 20.0)) / active
         weight = float(control.get("weight", 1.0))
         log_every = int(control.get("log_every", 0))
         loss_stop = float(control.get("loss_stop", 5e-7))
-        log_context = control.get("log_context", "")
-        update_mask = control.get("update_mask")
-        if update_mask is not None:
-            update_mask = update_mask.to(device=x0.device, dtype=torch.bool).view(-1, 1, 1, 1)
+        variance = 1
+        x = x0.detach()
 
-        with torch.enable_grad():
-            x = x0.detach().clone().requires_grad_(True)
-            optimizer = torch.optim.Adam([x], lr=lr)
-            for opt_i in range(n_iters):
-                optimizer.zero_grad(set_to_none=True)
+        for opt_i in range(n_iters):
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
                 joints = guidance_fn(x, bool(control.get("freeze_root", True)))
                 frame_mask = mask.unsqueeze(-1)
                 diff = (joints - hint) * frame_mask
                 loss = 0.5 * diff.pow(2).sum() * weight
-                loss.backward()
-                if update_mask is not None and x.grad is not None:
-                    x.grad = x.grad * update_mask
-                grad_norm = x.grad.detach().norm().item() if x.grad is not None else 0.0
-                optimizer.step()
-                if update_mask is not None:
-                    with torch.no_grad():
-                        x.copy_(torch.where(update_mask, x, x0))
-
-                loss_value = loss.detach().item()
-                if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
-                    context = f" {log_context}" if log_context else ""
-                    t_log = t.detach().cpu().tolist() if t.dim() > 0 else int(t.item())
-                    print(
-                        f"[guidance]{context} t={t_log} opt={opt_i + 1}/{n_iters} "
-                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f}"
-                    )
-                if loss_value <= loss_stop:
-                    break
+                grad = torch.autograd.grad(loss, x)[0]
+                x = x - scale * variance * grad
+            loss_value = loss.detach().item()
+            if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
+                print(
+                    f"[guidance] t={int(t.item())} opt={opt_i + 1}/{n_iters} "
+                    f"loss={loss_value:.6f} grad={grad.detach().norm().item():.6f} "
+                    f"variance={variance:.6f}"
+                )
+            if loss_value <= loss_stop:
+                break
         return x.detach()
 
 
@@ -237,7 +219,6 @@ class GestureDiffusion(torch.nn.Module):
         style_feature = cond_['y']['style_feature']
         control = cond_['y'].get('control')
         guidance_fn = cond_['y'].get('guidance_fn')
-        seed_update_fn = cond_['y'].get('seed_update_fn')
 
         audio_feat = self.modality_encoder(audio, word)
 
@@ -247,8 +228,7 @@ class GestureDiffusion(torch.nn.Module):
 
         latents = self._diffusion_reverse(
             latents, seed, audio_feat, guidance_scale=self.guidance_scale,
-            control=control, guidance_fn=guidance_fn,
-            seed_update_fn=seed_update_fn)
+            control=control, guidance_fn=guidance_fn)
 
         return latents
 
@@ -262,14 +242,16 @@ class GestureDiffusion(torch.nn.Module):
             guidance_scale: float = 1,
             control: Optional[dict] = None,
             guidance_fn = None,
-            seed_update_fn = None,
     ) -> torch.Tensor:
 
         return_dict = {}
         # scale the initial noise by the standard deviation required by the scheduler, like in Stable Diffusion
         # this is the initial noise need to be returned for rectified training
         latents = latents * self.scheduler.init_noise_sigma
+
+
         noise = latents
+
 
         return_dict["init_noise"] = latents
         return_dict['at_feat'] = at_feat
@@ -278,10 +260,9 @@ class GestureDiffusion(torch.nn.Module):
         # set timesteps
         self.scheduler.set_timesteps(self.cfg.model.scheduler.num_inference_steps)
         timesteps = self.scheduler.timesteps.to(at_feat.device)
-        num_steps = len(timesteps)
-        chunk_delay = max(0, int(control.get("chunk_delay", 0))) if control is not None else 0
 
         latents = torch.zeros_like(latents)
+
         latents = self.scheduler.add_noise(latents, noise, timesteps[0])
 
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -291,124 +272,26 @@ class GestureDiffusion(torch.nn.Module):
                 inspect.signature(self.scheduler.step).parameters.keys()):
             extra_step_kwargs["eta"] = self.cfg.model.scheduler.eta
 
-        if chunk_delay <= 0:
-            logger.info(
-                "[delay] disabled chunk_delay=0 chunks=%s ddim_steps=%s",
-                latents.shape[0], num_steps,
-            )
-            for wave_i, t in enumerate(timesteps):
-                latent_model_input = latents
-                # actually it does nothing here according to ddim scheduler
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+        for i, t in enumerate(timesteps):
+            latent_model_input = latents
+            # actually it does nothing here according to ddim scheduler
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                model_output = self.apply_classifier_free_guidance(
-                    x=latent_model_input,
-                    timesteps=t,
-                    seed=seed,
-                    at_feat=at_feat,
-                    guidance_scale=guidance_scale)
-
-                t_batch = None
-                x0_for_seed = None
-                if control is not None and guidance_fn is not None:
-                    t_batch = t.expand(latents.shape[0])
-                    latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
-                    step_control = dict(control)
-                    step_control["log_context"] = (
-                        f"wave={wave_i:02d} chunks={list(range(latents.shape[0]))}"
-                    )
-                    guided_x0 = self._spatial_guidance_step(
-                        latents_pred_x0, t, guidance_fn, step_control
-                    )
-                    model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
-                    x0_for_seed = guided_x0
-
-                if seed_update_fn is not None:
-                    if x0_for_seed is None:
-                        if t_batch is None:
-                            t_batch = t.expand(latents.shape[0])
-                        x0_for_seed, _ = self.predicted_origin(model_output, t_batch, latents)
-                    seed = seed_update_fn(x0_for_seed.detach(), seed).detach()
-
-                latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
-            return_dict['latents'] = latents
-            return return_dict
-
-        chunk_indices = torch.arange(latents.shape[0], device=at_feat.device)
-        wave_steps = num_steps + int(chunk_indices[-1].item()) * chunk_delay
-        logger.info(
-            "[delay] enabled chunk_delay=%s chunks=%s ddim_steps=%s wave_steps=%s",
-            chunk_delay, latents.shape[0], num_steps, wave_steps,
-        )
-
-        x0_estimate = torch.zeros_like(latents)
-        for wave_i in range(wave_steps):
-            local_steps = wave_i - chunk_indices * chunk_delay
-            active = (local_steps >= 0) & (local_steps < num_steps)
-            if not active.any():
-                continue
-
-            active_chunks = chunk_indices[active]
-            active_local_steps = local_steps[active]
-            active_timesteps = timesteps[active_local_steps]
-            logger.info(
-                "[delay] wave=%02d active=%s chunks=%s local_steps=%s t=%s",
-                wave_i,
-                int(active_chunks.numel()),
-                active_chunks.detach().cpu().tolist(),
-                active_local_steps.detach().cpu().tolist(),
-                active_timesteps.detach().cpu().tolist(),
-            )
-
-            latent_model_input = self.scheduler.scale_model_input(
-                latents[active_chunks], active_timesteps
-            )
+            # predict the noise residual
             model_output = self.apply_classifier_free_guidance(
                 x=latent_model_input,
-                timesteps=active_timesteps,
-                seed=seed[active_chunks],
-                at_feat=at_feat[active_chunks],
+                timesteps=t,
+                seed=seed,
+                at_feat=at_feat,
                 guidance_scale=guidance_scale)
 
-            pred_x0_active, _ = self.predicted_origin(
-                model_output, active_timesteps, latents[active_chunks]
-            )
-            x0_estimate[active_chunks] = pred_x0_active
-
             if control is not None and guidance_fn is not None:
-                step_control = dict(control)
-                constraint = local_steps >= 0
-                constraint_chunks = chunk_indices[constraint]
-                constraint_mask = torch.zeros_like(control["mask"])
-                constraint_mask[constraint_chunks] = control["mask"][constraint_chunks]
-                step_control["mask"] = constraint_mask
-                update_mask = torch.zeros(latents.shape[0], device=latents.device, dtype=torch.bool)
-                update_mask[active_chunks] = True
-                step_control["update_mask"] = update_mask
-                step_control["log_context"] = (
-                    f"wave={wave_i:02d} active={active_chunks.detach().cpu().tolist()} "
-                    f"loss={constraint_chunks.detach().cpu().tolist()}"
-                )
-                guided_x0 = self._spatial_guidance_step(
-                    x0_estimate, active_timesteps, guidance_fn, step_control
-                )
-                x0_estimate[active_chunks] = guided_x0[active_chunks]
-                model_output = self.model_output_from_origin(
-                    guided_x0[active_chunks], active_timesteps, latents[active_chunks]
-                )
+                t_batch = t.expand(latents.shape[0])
+                latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
+                guided_x0 = self._spatial_guidance_step(latents_pred_x0, t, guidance_fn, control)
+                model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
 
-            for local_step in torch.unique(active_local_steps, sorted=True):
-                group_positions = torch.where(active_local_steps == local_step)[0]
-                group = active_chunks[group_positions]
-                t = timesteps[int(local_step.item())]
-                latents[group] = self.scheduler.step(
-                    model_output[group_positions], t, latents[group], **extra_step_kwargs
-                ).prev_sample
-
-            if seed_update_fn is not None:
-                seed = seed_update_fn(x0_estimate.detach(), seed).detach()
-
+            latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
         return_dict['latents'] = latents
         return return_dict
 
