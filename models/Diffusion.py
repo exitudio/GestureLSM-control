@@ -49,6 +49,14 @@ class GestureDiffusion(torch.nn.Module):
         Returns:
             Guided output tensor
         """
+        batch_size = x.shape[0]
+        if timesteps.dim() == 0:
+            timesteps = timesteps.expand(batch_size)
+        elif timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"timesteps batch mismatch: got {timesteps.shape[0]}, expected {batch_size}"
+            )
+
         if guidance_scale <= 1.0:
             # No guidance needed, run normal forward pass
             return self.denoiser(
@@ -64,10 +72,7 @@ class GestureDiffusion(torch.nn.Module):
         x_doubled = torch.cat([x] * 2, dim=0)
         seed_doubled = torch.cat([seed] * 2, dim=0)
         at_feat_doubled = torch.cat([at_feat] * 2, dim=0)
-        
-        # Properly expand timesteps to match doubled batch size
-        batch_size = x.shape[0]
-        timesteps_doubled = timesteps.expand(batch_size * 2)
+        timesteps_doubled = torch.cat([timesteps, timesteps], dim=0)
         
         # Create conditional and unconditional audio features
         batch_size = at_feat.shape[0]
@@ -176,36 +181,39 @@ class GestureDiffusion(torch.nn.Module):
             mask = mask.unsqueeze(0)
 
         late_start = int(control.get("late_start", 300))
-        n_iters = int(control.get("iters_late", 30) if int(t.item()) <= late_start else control.get("iters_early", 5))
+        t_for_schedule = t.min() if t.dim() > 0 else t
+        n_iters = int(control.get("iters_late", 30) if int(t_for_schedule.item()) <= late_start else control.get("iters_early", 5))
         if n_iters <= 0:
             return x0
 
         active = torch.clamp((mask > 0).sum().to(dtype=x0.dtype), min=1.0)
-        scale = float(control.get("scale", 20.0)) / active
+        lr = float(control.get("scale", 20.0)) / active.item()
         weight = float(control.get("weight", 1.0))
         log_every = int(control.get("log_every", 0))
         loss_stop = float(control.get("loss_stop", 5e-7))
-        variance = 1
-        x = x0.detach()
-
-        for opt_i in range(n_iters):
-            with torch.enable_grad():
-                x = x.detach().requires_grad_(True)
+        log_context = control.get("log_context", "")
+        with torch.enable_grad():
+            x = x0.detach().clone().requires_grad_(True)
+            optimizer = torch.optim.Adam([x], lr=lr)
+            for opt_i in range(n_iters):
+                optimizer.zero_grad(set_to_none=True)
                 joints = guidance_fn(x, bool(control.get("freeze_root", True)))
                 frame_mask = mask.unsqueeze(-1)
                 diff = (joints - hint) * frame_mask
                 loss = 0.5 * diff.pow(2).sum() * weight
-                grad = torch.autograd.grad(loss, x)[0]
-                x = x - scale * variance * grad
-            loss_value = loss.detach().item()
-            if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
-                print(
-                    f"[guidance] t={int(t.item())} opt={opt_i + 1}/{n_iters} "
-                    f"loss={loss_value:.6f} grad={grad.detach().norm().item():.6f} "
-                    f"variance={variance:.6f}"
-                )
-            if loss_value <= loss_stop:
-                break
+                loss.backward()
+                grad_norm = x.grad.detach().norm().item() if x.grad is not None else 0.0
+                optimizer.step()
+                loss_value = loss.detach().item()
+                if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
+                    context = f" {log_context}" if log_context else ""
+                    t_log = t.detach().cpu().tolist() if t.dim() > 0 else int(t.item())
+                    print(
+                        f"[guidance]{context} t={t_log} opt={opt_i + 1}/{n_iters} "
+                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f}"
+                    )
+                if loss_value <= loss_stop:
+                    break
         return x.detach()
 
 
@@ -219,6 +227,7 @@ class GestureDiffusion(torch.nn.Module):
         style_feature = cond_['y']['style_feature']
         control = cond_['y'].get('control')
         guidance_fn = cond_['y'].get('guidance_fn')
+        seed_update_fn = cond_['y'].get('seed_update_fn')
 
         audio_feat = self.modality_encoder(audio, word)
 
@@ -228,7 +237,8 @@ class GestureDiffusion(torch.nn.Module):
 
         latents = self._diffusion_reverse(
             latents, seed, audio_feat, guidance_scale=self.guidance_scale,
-            control=control, guidance_fn=guidance_fn)
+            control=control, guidance_fn=guidance_fn,
+            seed_update_fn=seed_update_fn)
 
         return latents
 
@@ -242,16 +252,14 @@ class GestureDiffusion(torch.nn.Module):
             guidance_scale: float = 1,
             control: Optional[dict] = None,
             guidance_fn = None,
+            seed_update_fn = None,
     ) -> torch.Tensor:
 
         return_dict = {}
         # scale the initial noise by the standard deviation required by the scheduler, like in Stable Diffusion
         # this is the initial noise need to be returned for rectified training
         latents = latents * self.scheduler.init_noise_sigma
-
-
         noise = latents
-
 
         return_dict["init_noise"] = latents
         return_dict['at_feat'] = at_feat
@@ -260,9 +268,15 @@ class GestureDiffusion(torch.nn.Module):
         # set timesteps
         self.scheduler.set_timesteps(self.cfg.model.scheduler.num_inference_steps)
         timesteps = self.scheduler.timesteps.to(at_feat.device)
+        num_steps = len(timesteps)
+        chunk_delay = max(0, int(control.get("chunk_delay", 0))) if control is not None else 0
+        if chunk_delay > 0:
+            logger.warning(
+                "Ignoring chunk_delay=%s; delayed wave scheduling is disabled.",
+                chunk_delay,
+            )
 
         latents = torch.zeros_like(latents)
-
         latents = self.scheduler.add_noise(latents, noise, timesteps[0])
 
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -272,7 +286,11 @@ class GestureDiffusion(torch.nn.Module):
                 inspect.signature(self.scheduler.step).parameters.keys()):
             extra_step_kwargs["eta"] = self.cfg.model.scheduler.eta
 
-        for i, t in enumerate(timesteps):
+        logger.info(
+            "[delay] disabled chunks=%s ddim_steps=%s",
+            latents.shape[0], num_steps,
+        )
+        for wave_i, t in enumerate(timesteps):
             latent_model_input = latents
             # actually it does nothing here according to ddim scheduler
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -285,13 +303,30 @@ class GestureDiffusion(torch.nn.Module):
                 at_feat=at_feat,
                 guidance_scale=guidance_scale)
 
+            t_batch = None
+            x0_for_seed = None
             if control is not None and guidance_fn is not None:
                 t_batch = t.expand(latents.shape[0])
                 latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
-                guided_x0 = self._spatial_guidance_step(latents_pred_x0, t, guidance_fn, control)
+                step_control = dict(control)
+                step_control["log_context"] = (
+                    f"wave={wave_i:02d} chunks={list(range(latents.shape[0]))}"
+                )
+                guided_x0 = self._spatial_guidance_step(
+                    latents_pred_x0, t, guidance_fn, step_control
+                )
                 model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
+                x0_for_seed = guided_x0
+
+            if seed_update_fn is not None:
+                if x0_for_seed is None:
+                    if t_batch is None:
+                        t_batch = t.expand(latents.shape[0])
+                    x0_for_seed, _ = self.predicted_origin(model_output, t_batch, latents)
+                seed = seed_update_fn(x0_for_seed.detach(), seed).detach()
 
             latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
+
         return_dict['latents'] = latents
         return return_dict
 

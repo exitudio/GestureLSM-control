@@ -141,13 +141,13 @@ control_eval:
     - [left_wrist]
     - [right_wrist]
     - [head, left_wrist, right_wrist]
-  densities: [1, 2, 5, 50, 100]
+  densities: [1, 2, 5, 50, 100, -1]
   threshold_m: 0.5
   seed: 42
   iters_early: 5
   iters_late: 30
   late_start: 300
-  scale: 20.0
+  scale: 1.0
   weight: 1.0
   log_every: 0
   freeze_root: True

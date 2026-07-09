@@ -38,14 +38,16 @@ _my_parser.add_argument("--config", "-c", default=None,
                         help="Advanced override for the generation config.")
 _my_parser.add_argument("--control_json", default=None,
                         help="Optional sparse joint control JSON for diffusion mode.")
-_my_parser.add_argument("--control_joint",
-                        choices=("left_wrist", "right_wrist", "head", "pelvis"),
+_my_parser.add_argument("--control_joint", "--control_joints",
+                        dest="control_joints",
+                        choices=("head", "left_wrist", "right_wrist", "all", "pelvis"),
                         default="left_wrist",
-                        help="GT joint to use for automatic control when --control_json is omitted.")
-_my_parser.add_argument("--control_timing",
-                        choices=("end", "chunk_end"),
-                        default="end",
-                        help="Automatic GT control timing: final generated frame or every chunk end.")
+                        help="GT joint group for automatic control when --control_json is omitted.")
+_my_parser.add_argument("--control_density", type=int, default=-1,
+                        help="Automatic GT control density: 1/2/5 random frames, "
+                             "50/100 percent random frames, or -1 for chunk end.")
+_my_parser.add_argument("--control_timing", choices=("end", "chunk_end"), default=None,
+                        help=argparse.SUPPRESS)
 _my_parser.add_argument("--disable_auto_control", action="store_true",
                         help="Disable automatic GT control when --control_json is omitted.")
 _my_parser.add_argument("--guidance_iters_early", type=int, default=5)
@@ -54,6 +56,9 @@ _my_parser.add_argument("--guidance_late_start", type=int, default=300,
                         help="Diffusion timestep threshold for late guidance iterations.")
 _my_parser.add_argument("--guidance_scale_base", type=float, default=20.0)
 _my_parser.add_argument("--guidance_weight", type=float, default=1.0)
+_my_parser.add_argument("--guidance_chunk_delay", type=int, default=0,
+                        help="Delay chunk k by k*N DDIM waves during batched guided diffusion. "
+                             "Use 0 for the all-chunks-at-once schedule.")
 _my_parser.add_argument("--guidance_log_every", type=int, default=5,
                         help="Print guidance loss at this optimizer-step interval. Use 0 to disable.")
 _my_parser.add_argument("--guidance_freeze_root", type=lambda v: str(v).lower() not in ("0", "false", "no"),
@@ -97,7 +102,7 @@ from transformers import pipeline
 from dataloaders.build_vocab import Vocab  # noqa: F401  pickle needs it in __main__
 from dataloaders.data_tools import joints_list
 from models.vq.model import RVQVAE
-from utils import config, other_tools, other_tools_hf, rotation_conversions as rc
+from utils import config, guidance as guidance_utils, other_tools, other_tools_hf, rotation_conversions as rc
 # Imported for dynamic globals()[f'{part}_body_mask'] lookup below.
 from utils.joints import hands_body_mask, lower_body_mask, upper_body_mask  # noqa: F401
 
@@ -288,86 +293,121 @@ class HTMLTrainer:
         return {"hint": hint, "mask": mask}
 
     def _lower_latents_to_trans(self, lower_latents):
-        rec_lower = self.vq_model_lower.decode_continuous(
-            lower_latents * self.vqvae_latent_scale
+        return guidance_utils.lower_latents_to_trans(
+            lower_latents,
+            self.vq_model_lower,
+            self.vqvae_latent_scale,
+            self.trans_mean,
+            self.trans_std,
         )
-        rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
-        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
-        rec_trans[..., 1] = rec_trans_v[..., 1]
-        return rec_trans
 
     def _latent_chunk_to_joints(self, latent, betas, freeze_root=True, trans_offset=None):
-        sample = latent.squeeze(2).permute(0, 2, 1)
-        rec_up = sample[..., :128] * self.vqvae_latent_scale
-        rec_hn = sample[..., 128:256] * self.vqvae_latent_scale
-        rec_lo = sample[..., 256:] * self.vqvae_latent_scale
-
-        rec_upper = self.vq_model_upper.decode_continuous(rec_up)
-        rec_hands = self.vq_model_hands.decode_continuous(rec_hn)
-        rec_lower = self.vq_model_lower.decode_continuous(rec_lo)
-
-        if self.use_trans:
-            rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
-            rec_trans = torch.cumsum(rec_trans_v, dim=-2)
-            rec_trans[..., 1] = rec_trans_v[..., 1]
-            if trans_offset is not None:
-                rec_trans = rec_trans + trans_offset.to(
-                    device=rec_trans.device,
-                    dtype=rec_trans.dtype,
-                ).view(1, 1, 3)
-            rec_lower = rec_lower[..., :-3]
-        else:
-            rec_trans = torch.zeros(
-                (sample.shape[0], sample.shape[1], 3),
-                device=sample.device,
-                dtype=sample.dtype,
-            )
-
-        if freeze_root:
-            rec_trans = rec_trans.detach()
-
-        if self.args.pose_norm:
-            rec_upper = rec_upper * self.std_upper + self.mean_upper
-            rec_hands = rec_hands * self.std_hands + self.mean_hands
-            rec_lower = rec_lower * self.std_lower + self.mean_lower
-
-        bs_l, n_l = rec_lower.shape[0], rec_lower.shape[1]
-        ru = rc.matrix_to_axis_angle(
-            rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
-        ).reshape(bs_l * n_l, 13 * 3)
-        rh = rc.matrix_to_axis_angle(
-            rc.rotation_6d_to_matrix(rec_hands.reshape(bs_l, n_l, 30, 6))
-        ).reshape(bs_l * n_l, 30 * 3)
-        rl = rc.matrix_to_axis_angle(
-            rc.rotation_6d_to_matrix(rec_lower[..., :54].reshape(bs_l, n_l, 9, 6))
-        ).reshape(bs_l * n_l, 9 * 3)
-
-        N = bs_l * n_l
-        rec_pose = (self._inverse_selection(ru, self.joint_mask_upper, N)
-                    + self._inverse_selection(rl, self.joint_mask_lower, N)
-                    + self._inverse_selection(rh, self.joint_mask_hands, N))
-        aa = rec_pose.reshape(N, 55, 3)
-        body_betas = (
-            betas[:, None, :]
-            .expand(bs_l, n_l, -1)
-            .reshape(N, -1)
-            .to(sample.device)
-            .float()
+        return guidance_utils.latent_tensor_to_joints(
+            latent,
+            betas,
+            self.smplx,
+            self._inverse_selection,
+            self.joint_mask_upper,
+            self.joint_mask_lower,
+            self.joint_mask_hands,
+            self.vq_model_upper,
+            self.vq_model_hands,
+            self.vq_model_lower,
+            self.vqvae_latent_scale,
+            self.trans_mean,
+            self.trans_std,
+            self.mean_upper,
+            self.std_upper,
+            self.mean_hands,
+            self.std_hands,
+            self.mean_lower,
+            self.std_lower,
+            pose_norm=self.args.pose_norm,
+            use_trans=self.use_trans,
+            freeze_root=freeze_root,
+            trans_offset=trans_offset,
         )
-        out = self.smplx(
-            betas=body_betas,
-            global_orient=aa[:, 0],
-            body_pose=aa[:, 1:22].reshape(N, 63),
-            jaw_pose=aa[:, 22],
-            leye_pose=aa[:, 23],
-            reye_pose=aa[:, 24],
-            left_hand_pose=aa[:, 25:40].reshape(N, 45),
-            right_hand_pose=aa[:, 40:55].reshape(N, 45),
-            transl=rec_trans.reshape(N, 3).float(),
-            expression=torch.zeros(N, 100, device=sample.device),
-            return_verts=False,
+
+    def _stitch_chunk_latents(self, chunk_latents):
+        return guidance_utils.stitch_chunk_latents(chunk_latents, self.args.pre_frames)
+
+    def _decode_full_latents(self, full_latents, freeze_root=False):
+        return guidance_utils.decode_latents(
+            full_latents,
+            self.vq_model_upper,
+            self.vq_model_hands,
+            self.vq_model_lower,
+            self.vqvae_latent_scale,
+            self.trans_mean,
+            self.trans_std,
+            self.mean_upper,
+            self.std_upper,
+            self.mean_hands,
+            self.std_hands,
+            self.mean_lower,
+            self.std_lower,
+            pose_norm=self.args.pose_norm,
+            use_trans=self.use_trans,
+            freeze_root=freeze_root,
         )
-        return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+
+    def _full_latents_to_joints(self, full_latents, betas, freeze_root=True):
+        return guidance_utils.latents_to_joints(
+            full_latents,
+            betas,
+            self.smplx,
+            self._inverse_selection,
+            self.joint_mask_upper,
+            self.joint_mask_lower,
+            self.joint_mask_hands,
+            self.vq_model_upper,
+            self.vq_model_hands,
+            self.vq_model_lower,
+            self.vqvae_latent_scale,
+            self.trans_mean,
+            self.trans_std,
+            self.mean_upper,
+            self.std_upper,
+            self.mean_hands,
+            self.std_hands,
+            self.mean_lower,
+            self.std_lower,
+            pose_norm=self.args.pose_norm,
+            use_trans=self.use_trans,
+            freeze_root=freeze_root,
+        )
+
+    def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
+        return guidance_utils.latent_batch_to_window_joints(
+            latent,
+            round_l,
+            self.args.pose_length,
+            self.args.pre_frames,
+            betas,
+            self.smplx,
+            self._inverse_selection,
+            self.joint_mask_upper,
+            self.joint_mask_lower,
+            self.joint_mask_hands,
+            self.vq_model_upper,
+            self.vq_model_hands,
+            self.vq_model_lower,
+            self.vqvae_latent_scale,
+            self.trans_mean,
+            self.trans_std,
+            self.mean_upper,
+            self.std_upper,
+            self.mean_hands,
+            self.std_hands,
+            self.mean_lower,
+            self.std_lower,
+            pose_norm=self.args.pose_norm,
+            use_trans=self.use_trans,
+            freeze_root=freeze_root,
+        )
+
+    def _update_dynamic_seeds(self, x0, first_seed):
+        return guidance_utils.update_dynamic_seeds(x0, first_seed, self.args.pre_frames)
 
     def _load_data(self, dict_data):
         tar_pose_raw = dict_data["pose"]
@@ -421,7 +461,6 @@ class HTMLTrainer:
         """Mirror of demo.BaseTrainer._g_test — produces rec_pose / rec_trans."""
         a = self.args
         bs, n = loaded_data["tar_pose"].shape[0], loaded_data["tar_pose"].shape[1]
-        j = self.joints
         tar_pose = loaded_data["tar_pose"]
         tar_trans = loaded_data["tar_trans"]
         in_word = loaded_data["in_word"]
@@ -438,90 +477,101 @@ class HTMLTrainer:
             in_seed = in_seed[:, :in_x0.shape[1]]
             n -= remain
 
-        rec_up, rec_hn, rec_lo = [], [], []
         vsq = a.vqvae_squeeze_scale
         roundt = (n - a.pre_frames * vsq) // (a.pose_length - a.pre_frames * vsq)
         round_l = a.pose_length - a.pre_frames * vsq
-        last_sample = None
-        chunk_trans_offset = torch.zeros(3, device=self.mean_upper.device)
         control_full = self._build_control_tensors(n)
         betas = loaded_data["tar_beta"][:, 0]
 
-        for i in range(roundt):
-            iw = in_word[:, i * round_l:(i + 1) * round_l + a.pre_frames * vsq]
-            ia = in_audio[:, i * (16000 // 30 * round_l):
-                          (i + 1) * (16000 // 30 * round_l) + 16000 // 30 * a.pre_frames * vsq]
-            iid = loaded_data["tar_id"][:, i * round_l:(i + 1) * round_l + a.pre_frames]
-            ix0 = in_x0[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
-            iseed = in_seed[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
-            iseed = iseed[:, :a.pre_frames] if i == 0 else last_sample[:, -a.pre_frames:]
+        audio_chunks, word_chunks, id_chunks = [], [], []
+        seed_chunks = []
+        first_seed = in_seed[:, :a.pre_frames]
 
-            cond = {"y": {
-                "audio_onset": ia, "word": iw, "id": iid, "seed": iseed,
-                "mask": (torch.zeros([a.batch_size, 1, 1, a.pose_length]) < 1).cuda(),
-                "style_feature": torch.zeros([bs, 512]).cuda(),
-            }}
-            if control_full is not None:
+        for i in range(roundt):
+            audio_chunks.append(
+                in_audio[:, i * (16000 // 30 * round_l):
+                         (i + 1) * (16000 // 30 * round_l) + 16000 // 30 * a.pre_frames * vsq]
+            )
+            word_chunks.append(in_word[:, i * round_l:(i + 1) * round_l + a.pre_frames * vsq])
+            id_chunks.append(loaded_data["tar_id"][:, i * round_l:(i + 1) * round_l + a.pre_frames])
+            seed_chunks.append(torch.zeros_like(first_seed) if i > 0 else first_seed)
+
+        final_chunks = None
+        if control_full is not None and _my_args.mode == "diffusion":
+            hint_chunks, mask_chunks = [], []
+            for i in range(roundt):
                 start = i * round_l
                 end = start + a.pose_length
                 chunk_hint = control_full["hint"][start:end].clone()
                 chunk_mask = control_full["mask"][start:end].clone()
                 if i > 0:
                     chunk_mask[:a.pre_frames * vsq] = 0
-                if chunk_mask.sum() > 0:
-                    cond["y"]["control"] = {
-                        "hint": chunk_hint,
-                        "mask": chunk_mask,
+                hint_chunks.append(chunk_hint.unsqueeze(0))
+                mask_chunks.append(chunk_mask.unsqueeze(0))
+
+            hint_batch = torch.cat(hint_chunks, dim=0)
+            mask_batch = torch.cat(mask_chunks, dim=0)
+            if mask_batch.sum() > 0:
+                cond = {"y": {
+                    "audio_onset": torch.cat(audio_chunks, dim=0),
+                    "word": torch.cat(word_chunks, dim=0),
+                    "id": torch.cat(id_chunks, dim=0),
+                    "seed": torch.cat(seed_chunks, dim=0),
+                    "mask": (torch.zeros([roundt, 1, 1, a.pose_length], device=self.mean_upper.device) < 1),
+                    "style_feature": torch.zeros([roundt, 512], device=self.mean_upper.device),
+                    "control": {
+                        "hint": hint_batch,
+                        "mask": mask_batch,
                         "iters_early": _my_args.guidance_iters_early,
                         "iters_late": _my_args.guidance_iters_late,
                         "late_start": _my_args.guidance_late_start,
                         "scale": _my_args.guidance_scale_base,
                         "weight": _my_args.guidance_weight,
+                        "chunk_delay": _my_args.guidance_chunk_delay,
                         "log_every": _my_args.guidance_log_every,
                         "freeze_root": _my_args.guidance_freeze_root,
-                    }
-                    cond["y"]["guidance_fn"] = (
-                        lambda x, freeze_root=True, betas=betas, trans_offset=chunk_trans_offset:
-                        self._latent_chunk_to_joints(x, betas, freeze_root, trans_offset)
-                    )
-                    logger.info(f"Guidance active for chunk {i}: {int((chunk_mask > 0).sum().item())} keyframes")
-            sample = self.model(cond)["latents"].squeeze().permute(1, 0).unsqueeze(0)
-            last_sample = sample.clone()
-            ru, rh, rl = sample[..., :128], sample[..., 128:256], sample[..., 256:]
-            if i == 0:
-                rec_up.append(ru); rec_hn.append(rh); rec_lo.append(rl)
-            else:
-                rec_up.append(ru[:, a.pre_frames:])
-                rec_hn.append(rh[:, a.pre_frames:])
-                rec_lo.append(rl[:, a.pre_frames:])
+                    },
+                }}
+                cond["y"]["guidance_fn"] = (
+                    lambda x, freeze_root=True, betas=betas, round_l=round_l:
+                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l)
+                )
+                cond["y"]["seed_update_fn"] = (
+                    lambda x, seed, first_seed=first_seed:
+                    self._update_dynamic_seeds(x, first_seed)
+                )
+                logger.info(
+                    "Dynamic-seed global guidance active: "
+                    f"{roundt} chunks, {int((mask_batch > 0).sum().item())} keyframes, "
+                    f"chunk_delay={_my_args.guidance_chunk_delay}"
+                )
+                final_chunks = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
 
-            if self.use_trans and i + 1 < roundt:
-                next_start = (i + 1) * round_l
-                lower_so_far = torch.cat(rec_lo, dim=1)
-                with torch.no_grad():
-                    trans_so_far = self._lower_latents_to_trans(lower_so_far)
-                    chunk_trans_offset = trans_so_far[:, next_start - 1].detach().squeeze(0)
-                    chunk_trans_offset[1] = 0
+        if final_chunks is None:
+            rec_chunks = []
+            last_sample = None
+            for i in range(roundt):
+                iseed = in_seed[:, i * round_l // vsq:(i + 1) * round_l // vsq + a.pre_frames]
+                iseed = iseed[:, :a.pre_frames] if i == 0 else last_sample[:, -a.pre_frames:]
+                cond = {"y": {
+                    "audio_onset": audio_chunks[i],
+                    "word": word_chunks[i],
+                    "id": id_chunks[i],
+                    "seed": iseed,
+                    "mask": (torch.zeros([bs, 1, 1, a.pose_length], device=self.mean_upper.device) < 1),
+                    "style_feature": torch.zeros([bs, 512], device=self.mean_upper.device),
+                }}
+                sample = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
+                last_sample = sample.clone()
+                rec_chunks.append(sample)
+            final_chunks = torch.cat(rec_chunks, dim=0)
 
-        rec_up = torch.cat(rec_up, dim=1) * self.vqvae_latent_scale
-        rec_hn = torch.cat(rec_hn, dim=1) * self.vqvae_latent_scale
-        rec_lo = torch.cat(rec_lo, dim=1) * self.vqvae_latent_scale
-        rec_upper = self.vq_model_upper.decode_continuous(rec_up)
-        rec_hands = self.vq_model_hands.decode_continuous(rec_hn)
-        rec_lower = self.vq_model_lower.decode_continuous(rec_lo)
+        full_latents = self._stitch_chunk_latents(final_chunks)
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            full_latents,
+            freeze_root=False,
+        )
 
-        if self.use_trans:
-            rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
-            rec_trans = torch.cumsum(rec_trans_v, dim=-2)
-            rec_trans[..., 1] = rec_trans_v[..., 1]
-            rec_lower = rec_lower[..., :-3]
-
-        if a.pose_norm:
-            rec_upper = rec_upper * self.std_upper + self.mean_upper
-            rec_hands = rec_hands * self.std_hands + self.mean_hands
-            rec_lower = rec_lower * self.std_lower + self.mean_lower
-
-        # re-combine upper / hands / lower into 165-d axis-angle pose
         bs_l, n_l = rec_lower.shape[0], rec_lower.shape[1]
         ru = rc.matrix_to_axis_angle(
             rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
@@ -537,12 +587,11 @@ class HTMLTrainer:
         rec_pose = (self._inverse_selection(ru, self.joint_mask_upper, N)
                     + self._inverse_selection(rl, self.joint_mask_lower, N)
                     + self._inverse_selection(rh, self.joint_mask_hands, N))
-        # keep jaw from target
-        rec_pose[:, 66:69] = tar_pose.reshape(bs * n, 55 * 3)[:bs_l * n_l, 66:69]
+        rec_pose[:, 66:69] = tar_pose.reshape(bs * n, 55 * 3)[:N, 66:69]
 
         n = n - ((n - a.pre_frames * vsq) % (a.pose_length - a.pre_frames * vsq))
         return {
-            "rec_pose_aa": rec_pose.reshape(bs_l, n_l, 165),  # axis-angle [bs, n, 165]
+            "rec_pose_aa": rec_pose.reshape(bs_l, n_l, 165),
             "rec_trans": rec_trans,
             "tar_beta": loaded_data["tar_beta"][:, :n_l],
         }
@@ -615,39 +664,54 @@ def expected_generated_frames(n_frames, args):
     return n_frames - ((n_frames - seed_frames) % round_l)
 
 
-CONTROL_JOINTS = {
-    "head": 15,
-    "left_wrist": 20,
-    "right_wrist": 21,
-    "pelvis": 0,
+CONTROL_JOINT_GROUPS = {
+    "head": (15,),
+    "left_wrist": (20,),
+    "right_wrist": (21,),
+    "all": (15, 20, 21),
+    "pelvis": (0,),
 }
 
 
-def build_gt_control_entries(gt_joints, max_frame, args, control_joint, control_timing):
-    joint = CONTROL_JOINTS[control_joint]
-    last_frame = min(max_frame, gt_joints.shape[0]) - 1
-    if last_frame < 0:
-        return []
-
-    if control_timing == "end":
-        frames = [last_frame]
-    elif control_timing == "chunk_end":
+def _control_frames_for_density(last_frame, args, density):
+    if density == -1:
         seed_frames = args.pre_frames * args.vqvae_squeeze_scale
         round_l = args.pose_length - seed_frames
         frames = list(range(args.pose_length - 1, last_frame + 1, round_l))
         if not frames or frames[-1] != last_frame:
             frames.append(last_frame)
-    else:
-        raise ValueError(f"Unknown control_timing: {control_timing}")
+        return frames
 
+    n_frames = last_frame + 1
+    if density in (1, 2, 5):
+        frame_count = min(n_frames, density)
+    else:
+        frame_count = min(n_frames, int(n_frames * density / 100))
+    if frame_count <= 0:
+        return []
+
+    rng = np.random.default_rng(42)
+    frames = np.asarray(rng.choice(n_frames, frame_count, replace=False), dtype=np.int64)
+    frames.sort()
+    return frames.tolist()
+
+
+def build_gt_control_entries(gt_joints, max_frame, args, control_joints, control_density):
+    joints = CONTROL_JOINT_GROUPS[control_joints]
+    last_frame = min(max_frame, gt_joints.shape[0]) - 1
+    if last_frame < 0:
+        return []
+
+    frames = _control_frames_for_density(last_frame, args, int(control_density))
     entries = []
     for frame in frames:
-        xyz = gt_joints[frame, joint].copy()
-        entries.append({
-            "frame": int(frame),
-            "joint": int(joint),
-            "xyz": xyz.tolist(),
-        })
+        for joint in joints:
+            xyz = gt_joints[frame, joint].copy()
+            entries.append({
+                "frame": int(frame),
+                "joint": int(joint),
+                "xyz": xyz.tolist(),
+            })
     return entries
 
 
@@ -689,16 +753,20 @@ def main():
 
     if not control_entries and not _my_args.disable_auto_control:
         generated_len = expected_generated_frames(gt_joints.shape[0], args)
+        control_density = _my_args.control_density
+        if _my_args.control_timing is not None:
+            control_density = -1 if _my_args.control_timing == "chunk_end" else 1
         control_entries = build_gt_control_entries(
             gt_joints,
             generated_len,
             args,
-            _my_args.control_joint,
-            _my_args.control_timing,
+            _my_args.control_joints,
+            control_density,
         )
+        density_name = "chunk_end" if int(control_density) == -1 else str(control_density)
         logger.info(
-            f"Using sparse GT {_my_args.control_joint} control points "
-            f"({_my_args.control_timing}): {len(control_entries)} keyframes"
+            f"Using sparse GT {_my_args.control_joints} control points "
+            f"(density_{density_name}): {len(control_entries)} keyframes"
         )
     trainer.control_entries = control_entries if _my_args.mode == "diffusion" else []
 
@@ -767,4 +835,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
