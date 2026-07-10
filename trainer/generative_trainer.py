@@ -89,13 +89,34 @@ def _control_cfg_value(cfg, name, default):
     return getattr(control_cfg, name)
 
 
+def _parse_control_joint_groups(groups):
+    if not isinstance(groups, str):
+        return groups
+
+    text = groups.strip()
+    if not text:
+        return []
+
+    if text.startswith("[[") and text.endswith("]]" ):
+        inner = text[2:-2]
+        return [
+            [name.strip().strip("'\"") for name in group.split(",") if name.strip()]
+            for group in inner.split("],[")
+        ]
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1]
+        return [[name.strip().strip("'\"") for name in inner.split(",") if name.strip()]]
+    return [[text.strip("'\"")]]
+
+
 def _normalize_control_joint_group(group):
     if isinstance(group, str):
+        group = group.strip().strip("'\"")
         if group not in CONTROL_JOINT_GROUPS:
             raise ValueError(f"Unknown control joint group: {group}")
         return group, CONTROL_JOINT_GROUPS[group]
 
-    names = [str(name) for name in group]
+    names = [str(name).strip().strip("'\"") for name in group]
     if names == ["head", "left_wrist", "right_wrist"]:
         return "all", CONTROL_JOINT_GROUPS["all"]
     joints = []
@@ -107,11 +128,11 @@ def _normalize_control_joint_group(group):
 
 
 def _control_eval_settings_from_cfg(cfg):
-    groups = _control_cfg_value(
+    groups = _parse_control_joint_groups(_control_cfg_value(
         cfg,
         "joints",
         (("head",), ("left_wrist",), ("right_wrist",), ("head", "left_wrist", "right_wrist")),
-    )
+    ))
     densities = _control_cfg_value(cfg, "densities", CONTROL_DENSITIES)
     settings = []
     for group in groups:
@@ -1519,10 +1540,10 @@ class CustomTrainer(BaseTrainer):
         control_log_sink = None
         if self.rank == 0:
             timestamp = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
-            control_eval_dir = os.path.join(
-                self.checkpoint_path,
-                f"control_eval_{timestamp}",
-            )
+            run_name = str(_control_cfg_value(self.cfg, "name", "")).strip()
+            run_name = run_name.replace(os.sep, "_")
+            folder_name = timestamp if not run_name else f"{timestamp}__{run_name}"
+            control_eval_dir = os.path.join(self.checkpoint_path, folder_name)
             os.makedirs(control_eval_dir, exist_ok=True)
             control_log_path = os.path.join(control_eval_dir, "control_eval.log")
             control_log_sink = logger.add(
@@ -1564,6 +1585,9 @@ class CustomTrainer(BaseTrainer):
         )
         logger.info(
             f"freeze_root: {bool(_control_cfg_value(self.cfg, 'freeze_root', True))}"
+        )
+        logger.info(
+            f"name: {str(_control_cfg_value(self.cfg, 'name', '')).strip()}"
         )
 
         try:

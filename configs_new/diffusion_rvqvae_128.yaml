@@ -136,6 +136,7 @@ validation:
 
 control_eval:
   enabled: False
+  name: ""
   joints:
     - [head]
     - [left_wrist]

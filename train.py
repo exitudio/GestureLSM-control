@@ -64,6 +64,12 @@ def prepare_all():
         default=None,
         help="Checkpoint path for testing or resuming training",
     )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Optional control-eval run name appended to the timestamp folder",
+    )
     parser.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -85,6 +91,11 @@ def prepare_all():
         cfg.wandb_project = "debug"
         cfg.exp_name = "debug"
         cfg.solver.max_train_steps = 4
+
+    if args.name is not None:
+        if not hasattr(cfg, "control_eval"):
+            cfg.control_eval = {}
+        cfg.control_eval.name = args.name
 
     # Process override arguments
     if args.overrides:
