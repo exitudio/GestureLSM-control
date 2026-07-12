@@ -92,16 +92,26 @@ def prepare_all():
         cfg.exp_name = "debug"
         cfg.solver.max_train_steps = 4
 
+    # Recover --name if it appears after config overrides. argparse.REMAINDER
+    # treats everything after the first override as an override token.
+    overrides = list(args.overrides or [])
+    if "--name" in overrides:
+        name_idx = overrides.index("--name")
+        if name_idx + 1 >= len(overrides):
+            raise ValueError("--name requires a value")
+        args.name = overrides[name_idx + 1]
+        del overrides[name_idx : name_idx + 2]
+
     if args.name is not None:
         if not hasattr(cfg, "control_eval"):
             cfg.control_eval = {}
         cfg.control_eval.name = args.name
 
     # Process override arguments
-    if args.overrides:
-        for arg in args.overrides:
+    if overrides:
+        for arg in overrides:
             if "=" in arg:
-                key, value = arg.split("=")
+                key, value = arg.split("=", 1)
                 try:
                     value = eval(value)
                 except:

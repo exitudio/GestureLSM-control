@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 from dataloaders import data_tools
 from dataloaders.data_tools import joints_list
 from loguru import logger
+from models.vq.encdec import Decoder
 from models.vq.model import RVQVAE
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
@@ -80,6 +81,26 @@ CONTROL_METRIC_NAMES = (
     "loc_err_50cm",
     "avg_err_cm",
 )
+
+
+class UnifiedRVQVAEDecoder(nn.Module):
+    def __init__(self, cfg, input_width=315, latent_width=384):
+        super().__init__()
+        self.latent_scale = cfg.vqvae_latent_scale
+        self.decoder = Decoder(
+            input_width,
+            latent_width,
+            down_t=2,
+            stride_t=2,
+            width=512,
+            depth=3,
+            dilation_growth_rate=3,
+            activation="relu",
+            norm=None,
+        )
+
+    def forward(self, latents):
+        return self.decoder(latents.permute(0, 2, 1) * self.latent_scale)
 
 
 def _control_cfg_value(cfg, name, default):
@@ -296,6 +317,14 @@ class CustomTrainer(BaseTrainer):
             np.load("./mean_std/beatx_2_trans_std.npy")
         ).cuda()
 
+        self.unified_pose_mask = []
+        for joint in list(range(0, 22)) + list(range(25, 55)):
+            self.unified_pose_mask.extend([joint * 6 + i for i in range(6)])
+        self.unified_decoder = None
+        unified_decoder_path = OmegaConf.select(self.cfg, "unified_decoder_path")
+        if unified_decoder_path:
+            self.unified_decoder = self._load_unified_decoder(unified_decoder_path)
+
         if self.args.checkpoint:
             try:
                 ckpt_state_dict = torch.load(self.args.checkpoint, weights_only=False)[
@@ -328,6 +357,15 @@ class CustomTrainer(BaseTrainer):
             vq_models[part] = model
 
         return vq_models
+
+    def _load_unified_decoder(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint.get("decoder", checkpoint)
+        model = UnifiedRVQVAEDecoder(self.cfg).to(self.rank)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        logger.info(f"Using unified RVQ-VAE decoder for evaluation: {checkpoint_path}")
+        return model
 
     def _create_rvqvae_model(self, dim_pose: int, body_part: str) -> RVQVAE:
         """Create a single RVQVAE model with specified configuration."""
@@ -458,6 +496,14 @@ class CustomTrainer(BaseTrainer):
         if mode == "train":
             return g_loss_final
 
+    def _named_test_epoch_dir(self, epoch):
+        timestamp = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
+        run_name = str(getattr(self.args, "name", "") or "").strip()
+        if run_name:
+            run_name = run_name.replace(os.sep, "_")
+            return os.path.join(self.checkpoint_path, f"{timestamp}__{run_name}")
+        return os.path.join(self.checkpoint_path, timestamp)
+
     def _control_eval_enabled(self):
         control_cfg = getattr(self.cfg, "control_eval", None)
         return bool(control_cfg is not None and getattr(control_cfg, "enabled", False))
@@ -498,7 +544,166 @@ class CustomTrainer(BaseTrainer):
             self.trans_std,
         )
 
+    def _decoder_latent_mode(self):
+        mode = str(OmegaConf.select(self.cfg, "decoder_latent_mode") or "continuous")
+        if mode not in ("continuous", "discrete"):
+            raise ValueError(f"Unknown decoder_latent_mode: {mode}")
+        return mode
+
+    @staticmethod
+    def _quantize_model_latents(model, latents, sample_codebook_temp=0.5):
+        quantized, _, _, _ = model.quantizer(
+            latents.permute(0, 2, 1),
+            sample_codebook_temp=sample_codebook_temp,
+        )
+        return quantized.permute(0, 2, 1)
+
+    def _split_scaled_latents(self, full_latents):
+        code_dim = self.vq_model_upper.code_dim
+        rec_all_upper = full_latents[..., :code_dim] * self.cfg.vqvae_latent_scale
+        rec_all_hands = full_latents[..., code_dim : code_dim * 2] * self.cfg.vqvae_latent_scale
+        rec_all_lower = full_latents[..., code_dim * 2 : code_dim * 3] * self.cfg.vqvae_latent_scale
+        return rec_all_upper, rec_all_hands, rec_all_lower
+
+    def _maybe_quantize_full_latents(self, full_latents):
+        if self._decoder_latent_mode() != "discrete":
+            return full_latents
+        rec_all_upper, rec_all_hands, rec_all_lower = self._split_scaled_latents(full_latents)
+        q_upper = self._quantize_model_latents(self.vq_model_upper, rec_all_upper)
+        q_hands = self._quantize_model_latents(self.vq_model_hands, rec_all_hands)
+        q_lower = self._quantize_model_latents(self.vq_model_lower, rec_all_lower)
+        return torch.cat([q_upper, q_hands, q_lower], dim=-1) / self.cfg.vqvae_latent_scale
+
+    def _decode_unified_latents(self, full_latents, freeze_root=False, trans_offset=None):
+        full_latents = self._maybe_quantize_full_latents(full_latents)
+        rec_full = self.unified_decoder(full_latents)
+        pose_full = torch.zeros(
+            (rec_full.shape[0], rec_full.shape[1], 330),
+            device=rec_full.device,
+            dtype=rec_full.dtype,
+        )
+        pose_full[..., self.unified_pose_mask] = rec_full[..., : len(self.unified_pose_mask)]
+
+        rec_upper = pose_full[..., upper_body_mask]
+        rec_hands = pose_full[..., hands_body_mask]
+        rec_lower = pose_full[..., lower_body_mask]
+
+        rec_trans_v = rec_full[
+            ..., len(self.unified_pose_mask) : len(self.unified_pose_mask) + 3
+        ]
+        rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
+        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+        rec_trans[..., 1] = rec_trans_v[..., 1]
+        if trans_offset is not None:
+            rec_trans = rec_trans + trans_offset.to(
+                device=rec_trans.device,
+                dtype=rec_trans.dtype,
+            ).view(1, 1, 3)
+
+        if freeze_root:
+            rec_trans = rec_trans.detach()
+
+        if getattr(self.cfg.data, "pose_norm", True):
+            rec_upper = rec_upper * self.std_upper + self.mean_upper
+            rec_hands = rec_hands * self.std_hands + self.mean_hands
+            rec_lower = rec_lower * self.std_lower + self.mean_lower
+
+        return rec_upper, rec_hands, rec_lower, rec_trans
+
+    def _decode_full_latents(self, full_latents, freeze_root=False, trans_offset=None):
+        if self.unified_decoder is not None:
+            return self._decode_unified_latents(
+                full_latents,
+                freeze_root=freeze_root,
+                trans_offset=trans_offset,
+            )
+
+        rec_all_upper, rec_all_hands, rec_all_lower = self._split_scaled_latents(full_latents)
+        if self._decoder_latent_mode() == "discrete":
+            rec_upper = self.vq_model_upper.latent2origin(rec_all_upper)[0]
+            rec_hands = self.vq_model_hands.latent2origin(rec_all_hands)[0]
+            rec_lower = self.vq_model_lower.latent2origin(rec_all_lower)[0]
+        else:
+            rec_upper = self.vq_model_upper.decode_continuous(rec_all_upper)
+            rec_hands = self.vq_model_hands.decode_continuous(rec_all_hands)
+            rec_lower = self.vq_model_lower.decode_continuous(rec_all_lower)
+
+        rec_trans_v = rec_lower[..., -3:]
+        rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
+        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+        rec_trans[..., 1] = rec_trans_v[..., 1]
+        if trans_offset is not None:
+            rec_trans = rec_trans + trans_offset.to(
+                device=rec_trans.device,
+                dtype=rec_trans.dtype,
+            ).view(1, 1, 3)
+        rec_lower = rec_lower[..., :-3]
+
+        if freeze_root:
+            rec_trans = rec_trans.detach()
+
+        if getattr(self.cfg.data, "pose_norm", True):
+            rec_upper = rec_upper * self.std_upper + self.mean_upper
+            rec_hands = rec_hands * self.std_hands + self.mean_hands
+            rec_lower = rec_lower * self.std_lower + self.mean_lower
+
+        return rec_upper, rec_hands, rec_lower, rec_trans
+
+    def _latents_to_joints_local(self, full_latents, betas, freeze_root=True, trans_offset=None):
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            full_latents,
+            freeze_root=freeze_root,
+            trans_offset=trans_offset,
+        )
+        bs_l, n_l = rec_lower.shape[:2]
+        ru = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
+        ).reshape(bs_l * n_l, 13 * 3)
+        rh = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_hands.reshape(bs_l, n_l, 30, 6))
+        ).reshape(bs_l * n_l, 30 * 3)
+        rl = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_lower[..., :54].reshape(bs_l, n_l, 9, 6))
+        ).reshape(bs_l * n_l, 9 * 3)
+
+        total = bs_l * n_l
+        rec_pose = (
+            self.inverse_selection_tensor(ru, self.joint_mask_upper, total)
+            + self.inverse_selection_tensor(rl, self.joint_mask_lower, total)
+            + self.inverse_selection_tensor(rh, self.joint_mask_hands, total)
+        )
+        aa = rec_pose.reshape(total, 55, 3)
+        body_betas = (
+            betas[:, None, :]
+            .expand(bs_l, n_l, -1)
+            .reshape(total, -1)
+            .to(full_latents.device)
+            .float()
+        )
+        out = self.smplx(
+            betas=body_betas,
+            global_orient=aa[:, 0],
+            body_pose=aa[:, 1:22].reshape(total, 63),
+            jaw_pose=aa[:, 22],
+            leye_pose=aa[:, 23],
+            reye_pose=aa[:, 24],
+            left_hand_pose=aa[:, 25:40].reshape(total, 45),
+            right_hand_pose=aa[:, 40:55].reshape(total, 45),
+            transl=rec_trans.reshape(total, 3).float(),
+            expression=torch.zeros(total, 100, device=full_latents.device),
+            return_verts=False,
+        )
+        return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+
     def _latent_chunk_to_joints(self, latent, betas, freeze_root=True, trans_offset=None):
+        if self.unified_decoder is not None:
+            sample = latent.squeeze(2).permute(0, 2, 1)
+            return self._latents_to_joints_local(
+                sample,
+                betas,
+                freeze_root=freeze_root,
+                trans_offset=trans_offset,
+            )
         return guidance_utils.latent_tensor_to_joints(
             latent,
             betas,
@@ -526,6 +731,22 @@ class CustomTrainer(BaseTrainer):
         )
 
     def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
+        if self.unified_decoder is not None:
+            chunk_latents = latent.squeeze(2).permute(0, 2, 1)
+            full_latents = guidance_utils.stitch_chunk_latents(
+                chunk_latents, self.cfg.pre_frames
+            )
+            full_joints = self._latents_to_joints_local(
+                full_latents,
+                betas,
+                freeze_root=freeze_root,
+            )
+            windows = []
+            for i in range(chunk_latents.shape[0]):
+                start = i * round_l
+                end = start + self.cfg.data.pose_length
+                windows.append(full_joints[:, start:end])
+            return torch.cat(windows, dim=0)
         return guidance_utils.latent_batch_to_window_joints(
             latent,
             round_l,
@@ -797,24 +1018,11 @@ class CustomTrainer(BaseTrainer):
             rec_all_hands = torch.cat(rec_all_hands, dim=1)
             rec_all_lower = torch.cat(rec_all_lower, dim=1)
 
-        rec_all_upper = rec_all_upper * 5
-        rec_all_hands = rec_all_hands * 5
-        rec_all_lower = rec_all_lower * 5
-
-        rec_upper = self.vq_model_upper.decode_continuous(rec_all_upper)
-        rec_hands = self.vq_model_hands.decode_continuous(rec_all_hands)
-        rec_lower = self.vq_model_lower.decode_continuous(rec_all_lower)
-
-        rec_trans_v = rec_lower[..., -3:]
-        rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
-        rec_trans = torch.zeros_like(rec_trans_v)
-        rec_trans = torch.cumsum(rec_trans_v, dim=-2)
-        rec_trans[..., 1] = rec_trans_v[..., 1]
-        rec_lower = rec_lower[..., :-3]
-
-        rec_upper = rec_upper * self.std_upper + self.mean_upper
-        rec_hands = rec_hands * self.std_hands + self.mean_hands
-        rec_lower = rec_lower * self.std_lower + self.mean_lower
+        rec_latents = torch.cat([rec_all_upper, rec_all_hands, rec_all_lower], dim=-1)
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            rec_latents,
+            freeze_root=False,
+        )
 
         n = n - remain
         tar_pose = tar_pose[:, :n, :]
@@ -911,6 +1119,7 @@ class CustomTrainer(BaseTrainer):
         mode="val",
         max_iterations=None,
         save_results=False,
+        results_save_path=None,
         control_setting=None,
         control_rng=None,
     ):
@@ -948,9 +1157,9 @@ class CustomTrainer(BaseTrainer):
         results = []
 
         # Setup save path for test mode
-        results_save_path = None
         if save_results:
-            results_save_path = self.checkpoint_path + f"/{epoch}/"
+            if results_save_path is None:
+                results_save_path = self._named_test_epoch_dir(epoch) + os.sep
             if mode == "test_render":
                 if os.path.exists(results_save_path):
                     import shutil
@@ -1647,11 +1856,24 @@ class CustomTrainer(BaseTrainer):
             logger.info(f"total control eval time: {int(end_time)} s")
             return
 
-        results_save_path = self.checkpoint_path + f"/{epoch}/"
+        test_run_dir = self._named_test_epoch_dir(epoch)
+        os.makedirs(test_run_dir, exist_ok=True)
+        self._save_control_eval_artifacts(test_run_dir)
+        results_save_path = os.path.join(test_run_dir, "samples") + os.sep
         os.makedirs(results_save_path, exist_ok=True)
+        test_log_sink = logger.add(
+            os.path.join(test_run_dir, "test.log"),
+            format="<blue>{time: MM-DD HH:mm:ss}</blue> | <level>{message}</level>",
+        )
+        logger.info(f"Test results dir: {test_run_dir}")
+        logger.info(f"Test samples dir: {results_save_path}")
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test", save_results=True
+            self.test_loader,
+            epoch,
+            mode="test",
+            save_results=True,
+            results_save_path=results_save_path,
         )
 
         total_length = results["total_length"]
@@ -1707,6 +1929,7 @@ class CustomTrainer(BaseTrainer):
         logger.info(
             f"total inference time: {int(end_time)} s for {int(total_length/self.cfg.data.pose_fps)} s motion"
         )
+        logger.remove(test_log_sink)
 
     def test_render(self, epoch):
         import platform

@@ -66,6 +66,14 @@ _my_parser.add_argument("--guidance_freeze_root", type=lambda v: str(v).lower() 
                         help="Detach generated translation inside the guidance loss.")
 _my_parser.add_argument("--no-cache", action="store_true",
                         help="Force rebuild of MFA TextGrid + dataloader LMDB cache.")
+_my_parser.add_argument("--unified-decoder-pth", default=None,
+                        help="Optional unified RVQ-VAE decoder checkpoint. When set, "
+                             "generation keeps the same latents but decodes them with "
+                             "this unified decoder instead of the upper/hands/lower decoders.")
+_my_parser.add_argument("--decoder-latent-mode", choices=("continuous", "discrete"),
+                        default="continuous",
+                        help="Use continuous generated latents directly, or quantize them "
+                             "through the RVQ codebooks before decoding like early GestureLSM.")
 _my_args, _rest = _my_parser.parse_known_args()
 if _my_args.config is None:
     _my_args.config = (
@@ -101,6 +109,7 @@ from transformers import pipeline
 
 from dataloaders.build_vocab import Vocab  # noqa: F401  pickle needs it in __main__
 from dataloaders.data_tools import joints_list
+from models.vq.encdec import Decoder
 from models.vq.model import RVQVAE
 from utils import config, guidance as guidance_utils, other_tools, other_tools_hf, rotation_conversions as rc
 # Imported for dynamic globals()[f'{part}_body_mask'] lookup below.
@@ -109,6 +118,27 @@ from utils.joints import hands_body_mask, lower_body_mask, upper_body_mask  # no
 warnings.simplefilter("ignore")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+class UnifiedRVQVAEDecoder(nn.Module):
+    def __init__(self, args, input_width=315, latent_width=384):
+        super().__init__()
+        self.latent_scale = args.vqvae_latent_scale
+        self.decoder = Decoder(
+            input_width,
+            latent_width,
+            args.down_t,
+            args.stride_t,
+            args.width,
+            args.depth,
+            args.dilation_growth_rate,
+            activation=args.vq_act,
+            norm=args.vq_norm,
+        )
+
+    def forward(self, latents):
+        # Generation latents are [B, T, 384]; the decoder expects [B, 384, T].
+        return self.decoder(latents.permute(0, 2, 1) * self.latent_scale)
 
 
 # ===================================================================
@@ -235,6 +265,13 @@ class HTMLTrainer:
             self.trans_mean = torch.from_numpy(np.load(args.mean_trans_path)).cuda()
             self.trans_std = torch.from_numpy(np.load(args.std_trans_path)).cuda()
 
+        self.unified_pose_mask = []
+        for joint in list(range(0, 22)) + list(range(25, 55)):
+            self.unified_pose_mask.extend([joint * 6 + i for i in range(6)])
+        self.unified_decoder = None
+        if _my_args.unified_decoder_pth is not None:
+            self.unified_decoder = self._unified_decoder(_my_args.unified_decoder_pth)
+
     def _face_vq(self, module):
         self.args.vae_layer = 2
         self.args.vae_length = 256
@@ -254,6 +291,15 @@ class HTMLTrainer:
             a.dilation_growth_rate, a.vq_act, a.vq_norm,
         )
         model.load_state_dict(torch.load(getattr(a, f"vqvae_{body_part}_path"))["net"])
+        return model
+
+    def _unified_decoder(self, ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state = ckpt.get("decoder", ckpt)
+        model = UnifiedRVQVAEDecoder(self.args).to(self.rank)
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        logger.info(f"Using unified RVQ-VAE decoder: {ckpt_path}")
         return model
 
     @staticmethod
@@ -301,7 +347,126 @@ class HTMLTrainer:
             self.trans_std,
         )
 
+    @staticmethod
+    def _quantize_model_latents(model, latents, sample_codebook_temp=0.5):
+        quantized, _, _, _ = model.quantizer(
+            latents.permute(0, 2, 1),
+            sample_codebook_temp=sample_codebook_temp,
+        )
+        return quantized.permute(0, 2, 1)
+
+    def _split_scaled_latents(self, full_latents):
+        code_dim = self.vq_model_upper.code_dim
+        rec_all_upper = full_latents[..., :code_dim] * self.vqvae_latent_scale
+        rec_all_hands = full_latents[..., code_dim:code_dim * 2] * self.vqvae_latent_scale
+        rec_all_lower = full_latents[..., code_dim * 2:code_dim * 3] * self.vqvae_latent_scale
+        return rec_all_upper, rec_all_hands, rec_all_lower
+
+    def _maybe_quantize_full_latents(self, full_latents):
+        if _my_args.decoder_latent_mode != "discrete":
+            return full_latents
+        rec_all_upper, rec_all_hands, rec_all_lower = self._split_scaled_latents(full_latents)
+        q_upper = self._quantize_model_latents(self.vq_model_upper, rec_all_upper)
+        q_hands = self._quantize_model_latents(self.vq_model_hands, rec_all_hands)
+        q_lower = self._quantize_model_latents(self.vq_model_lower, rec_all_lower)
+        return torch.cat([q_upper, q_hands, q_lower], dim=-1) / self.vqvae_latent_scale
+
+    def _decode_unified_latents(self, full_latents, freeze_root=False, trans_offset=None):
+        full_latents = self._maybe_quantize_full_latents(full_latents)
+        rec_full = self.unified_decoder(full_latents)
+        pose_full = torch.zeros(
+            (rec_full.shape[0], rec_full.shape[1], 330),
+            device=rec_full.device,
+            dtype=rec_full.dtype,
+        )
+        pose_full[..., self.unified_pose_mask] = rec_full[..., :len(self.unified_pose_mask)]
+
+        rec_upper = pose_full[..., upper_body_mask]
+        rec_hands = pose_full[..., hands_body_mask]
+        rec_lower = pose_full[..., lower_body_mask]
+
+        if self.use_trans:
+            rec_trans_v = rec_full[..., len(self.unified_pose_mask):len(self.unified_pose_mask) + 3]
+            rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
+            rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+            rec_trans[..., 1] = rec_trans_v[..., 1]
+            if trans_offset is not None:
+                rec_trans = rec_trans + trans_offset.to(
+                    device=rec_trans.device,
+                    dtype=rec_trans.dtype,
+                ).view(1, 1, 3)
+        else:
+            rec_trans = torch.zeros(
+                (full_latents.shape[0], full_latents.shape[1], 3),
+                device=full_latents.device,
+                dtype=full_latents.dtype,
+            )
+
+        if freeze_root:
+            rec_trans = rec_trans.detach()
+
+        if self.args.pose_norm:
+            rec_upper = rec_upper * self.std_upper + self.mean_upper
+            rec_hands = rec_hands * self.std_hands + self.mean_hands
+            rec_lower = rec_lower * self.std_lower + self.mean_lower
+
+        return rec_upper, rec_hands, rec_lower, rec_trans
+
+    def _latents_to_joints_local(self, full_latents, betas, freeze_root=True, trans_offset=None):
+        rec_upper, rec_hands, rec_lower, rec_trans = self._decode_full_latents(
+            full_latents,
+            freeze_root=freeze_root,
+            trans_offset=trans_offset,
+        )
+        bs_l, n_l = rec_lower.shape[:2]
+        ru = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_upper.reshape(bs_l, n_l, 13, 6))
+        ).reshape(bs_l * n_l, 13 * 3)
+        rh = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_hands.reshape(bs_l, n_l, 30, 6))
+        ).reshape(bs_l * n_l, 30 * 3)
+        rl = rc.matrix_to_axis_angle(
+            rc.rotation_6d_to_matrix(rec_lower[..., :54].reshape(bs_l, n_l, 9, 6))
+        ).reshape(bs_l * n_l, 9 * 3)
+
+        total = bs_l * n_l
+        rec_pose = (
+            self._inverse_selection(ru, self.joint_mask_upper, total)
+            + self._inverse_selection(rl, self.joint_mask_lower, total)
+            + self._inverse_selection(rh, self.joint_mask_hands, total)
+        )
+        aa = rec_pose.reshape(total, 55, 3)
+        body_betas = (
+            betas[:, None, :]
+            .expand(bs_l, n_l, -1)
+            .reshape(total, -1)
+            .to(full_latents.device)
+            .float()
+        )
+        out = self.smplx(
+            betas=body_betas,
+            global_orient=aa[:, 0],
+            body_pose=aa[:, 1:22].reshape(total, 63),
+            jaw_pose=aa[:, 22],
+            leye_pose=aa[:, 23],
+            reye_pose=aa[:, 24],
+            left_hand_pose=aa[:, 25:40].reshape(total, 45),
+            right_hand_pose=aa[:, 40:55].reshape(total, 45),
+            transl=rec_trans.reshape(total, 3).float(),
+            expression=torch.zeros(total, 100, device=full_latents.device),
+            return_verts=False,
+        )
+        return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+
     def _latent_chunk_to_joints(self, latent, betas, freeze_root=True, trans_offset=None):
+        if self.unified_decoder is not None:
+            sample = latent.squeeze(2).permute(0, 2, 1)
+            return self._latents_to_joints_local(
+                sample,
+                betas,
+                freeze_root=freeze_root,
+                trans_offset=trans_offset,
+            )
         return guidance_utils.latent_tensor_to_joints(
             latent,
             betas,
@@ -331,7 +496,41 @@ class HTMLTrainer:
     def _stitch_chunk_latents(self, chunk_latents):
         return guidance_utils.stitch_chunk_latents(chunk_latents, self.args.pre_frames)
 
-    def _decode_full_latents(self, full_latents, freeze_root=False):
+    def _decode_full_latents(self, full_latents, freeze_root=False, trans_offset=None):
+        if self.unified_decoder is not None:
+            return self._decode_unified_latents(
+                full_latents,
+                freeze_root=freeze_root,
+                trans_offset=trans_offset,
+            )
+        if _my_args.decoder_latent_mode == "discrete":
+            rec_up, rec_hn, rec_lo = self._split_scaled_latents(full_latents)
+            rec_upper = self.vq_model_upper.latent2origin(rec_up)[0]
+            rec_hands = self.vq_model_hands.latent2origin(rec_hn)[0]
+            rec_lower = self.vq_model_lower.latent2origin(rec_lo)[0]
+            if self.use_trans:
+                rec_trans_v = rec_lower[..., -3:] * self.trans_std + self.trans_mean
+                rec_trans = torch.cumsum(rec_trans_v, dim=-2)
+                rec_trans[..., 1] = rec_trans_v[..., 1]
+                if trans_offset is not None:
+                    rec_trans = rec_trans + trans_offset.to(
+                        device=rec_trans.device,
+                        dtype=rec_trans.dtype,
+                    ).view(1, 1, 3)
+                rec_lower = rec_lower[..., :-3]
+            else:
+                rec_trans = torch.zeros(
+                    (full_latents.shape[0], full_latents.shape[1], 3),
+                    device=full_latents.device,
+                    dtype=full_latents.dtype,
+                )
+            if freeze_root:
+                rec_trans = rec_trans.detach()
+            if self.args.pose_norm:
+                rec_upper = rec_upper * self.std_upper + self.mean_upper
+                rec_hands = rec_hands * self.std_hands + self.mean_hands
+                rec_lower = rec_lower * self.std_lower + self.mean_lower
+            return rec_upper, rec_hands, rec_lower, rec_trans
         return guidance_utils.decode_latents(
             full_latents,
             self.vq_model_upper,
@@ -349,9 +548,16 @@ class HTMLTrainer:
             pose_norm=self.args.pose_norm,
             use_trans=self.use_trans,
             freeze_root=freeze_root,
+            trans_offset=trans_offset,
         )
 
     def _full_latents_to_joints(self, full_latents, betas, freeze_root=True):
+        if self.unified_decoder is not None:
+            return self._latents_to_joints_local(
+                full_latents,
+                betas,
+                freeze_root=freeze_root,
+            )
         return guidance_utils.latents_to_joints(
             full_latents,
             betas,
@@ -378,6 +584,20 @@ class HTMLTrainer:
         )
 
     def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
+        if self.unified_decoder is not None:
+            chunk_latents = latent.squeeze(2).permute(0, 2, 1)
+            full_latents = self._stitch_chunk_latents(chunk_latents)
+            full_joints = self._latents_to_joints_local(
+                full_latents,
+                betas,
+                freeze_root=freeze_root,
+            )
+            windows = []
+            for i in range(chunk_latents.shape[0]):
+                start = i * round_l
+                end = start + self.args.pose_length
+                windows.append(full_joints[:, start:end])
+            return torch.cat(windows, dim=0)
         return guidance_utils.latent_batch_to_window_joints(
             latent,
             round_l,
