@@ -134,6 +134,9 @@ def _control_eval_settings_from_cfg(cfg):
         (("head",), ("left_wrist",), ("right_wrist",), ("head", "left_wrist", "right_wrist")),
     ))
     densities = _control_cfg_value(cfg, "densities", CONTROL_DENSITIES)
+    space = str(_control_cfg_value(cfg, "space", "absolute")).strip().lower()
+    if space not in ("absolute", "relative"):
+        raise ValueError(f"Unknown control_eval.space: {space}")
     settings = []
     for group in groups:
         group_name, joints = _normalize_control_joint_group(group)
@@ -145,6 +148,7 @@ def _control_eval_settings_from_cfg(cfg):
                 "joint_group": group_name,
                 "joints": joints,
                 "density": density,
+                "space": space,
             })
     return settings
 
@@ -525,8 +529,22 @@ class CustomTrainer(BaseTrainer):
             trans_offset=trans_offset,
         )
 
-    def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
-        return guidance_utils.latent_batch_to_window_joints(
+    @staticmethod
+    def _to_control_space(joints, space, root_rot=None):
+        if space != "relative":
+            return joints
+        if root_rot is None:
+            raise ValueError("control space 'relative' requires root rotations")
+        rel = joints - joints[..., 0:1, :]
+        if torch.is_tensor(rel):
+            return torch.matmul(
+                root_rot.transpose(-1, -2).unsqueeze(-3),
+                rel.unsqueeze(-1),
+            ).squeeze(-1)
+        return np.einsum("...ji,...kj->...ki", root_rot, rel)
+
+    def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l, control_space="absolute"):
+        decoded = guidance_utils.latent_batch_to_window_joints(
             latent,
             round_l,
             self.cfg.data.pose_length,
@@ -552,14 +570,26 @@ class CustomTrainer(BaseTrainer):
             pose_norm=getattr(self.cfg.data, "pose_norm", True),
             use_trans=True,
             freeze_root=freeze_root,
+            return_root_rot=(control_space == "relative"),
         )
+        if control_space == "relative":
+            joints, root_rot = decoded
+        else:
+            joints, root_rot = decoded, None
+        return self._to_control_space(joints, control_space, root_rot)
 
     def _update_dynamic_seeds(self, x0, first_seed):
         return guidance_utils.update_dynamic_seeds(x0, first_seed, self.cfg.pre_frames)
 
-    def _build_control_from_target(self, target_joints, setting, rng):
+    def _build_control_from_target(self, target_joints, setting, rng, root_rot=None):
+        control_space = setting.get("space", "absolute")
+        target_joints = self._to_control_space(
+            target_joints[:, :, :55],
+            control_space,
+            root_rot,
+        )
         bs, n = target_joints.shape[:2]
-        hint = torch.zeros_like(target_joints[:, :, :55])
+        hint = torch.zeros_like(target_joints)
         mask = torch.zeros(bs, n, 55, device=target_joints.device, dtype=target_joints.dtype)
         density = int(setting["density"])
         if density == -1:
@@ -647,9 +677,14 @@ class CustomTrainer(BaseTrainer):
                     tar_beta[:, :final_n],
                     tar_exps[:, :final_n],
                 )[:, :, :55]
+                target_root_rot = rc.axis_angle_to_matrix(
+                    tar_pose[:, :final_n, :3].reshape(-1, 3)
+                ).reshape(bs, final_n, 3, 3)
             control_full = self._build_control_from_target(
-                target_joints, control_setting, control_rng
+                target_joints, control_setting, control_rng, target_root_rot
             )
+            if control_full is not None:
+                control_full["space"] = control_setting.get("space", "absolute")
 
         if control_full is not None:
             if bs != 1:
@@ -713,9 +748,10 @@ class CustomTrainer(BaseTrainer):
                     "log_every": int(_control_cfg_value(self.cfg, "log_every", 0)),
                     "freeze_root": bool(_control_cfg_value(self.cfg, "freeze_root", True)),
                 }
+                control_space = control_full.get("space", "absolute")
                 cond_["y"]["guidance_fn"] = (
-                    lambda x, freeze_root=True, betas=tar_beta[:, 0], round_l=round_l:
-                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l)
+                    lambda x, freeze_root=True, betas=tar_beta[:, 0], round_l=round_l, control_space=control_space:
+                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l, control_space)
                 )
                 cond_["y"]["seed_update_fn"] = (
                     lambda x, seed, first_seed=first_seed:
@@ -868,6 +904,7 @@ class CustomTrainer(BaseTrainer):
             "tar_trans": tar_trans,
             "control_hint": control_full["hint"] if control_full is not None else None,
             "control_mask": control_full["mask"] if control_full is not None else None,
+            "control_space": control_full.get("space", "absolute") if control_full is not None else "absolute",
             "control_setting": control_setting,
         }
 
@@ -1033,6 +1070,13 @@ class CustomTrainer(BaseTrainer):
                 rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs * n, j * 3)
                 tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs * n, j, 6))
                 tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs * n, j * 3)
+                rec_root_rot_np = (
+                    rc.axis_angle_to_matrix(rec_pose[:, :3])
+                    .reshape(bs, n, 3, 3)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
 
                 # Generate SMPLX vertices and joints in the translation-free frame used
                 # by the existing BC/L1Div metrics.
@@ -1113,6 +1157,12 @@ class CustomTrainer(BaseTrainer):
                     control_mask = net_out.get("control_mask")
                     if control_hint is not None and control_mask is not None:
                         gen_global_joints = joints_rec_all + rec_trans_np[:, :, None, :]
+                        control_space = net_out.get("control_space", "absolute")
+                        gen_global_joints = self._to_control_space(
+                            gen_global_joints,
+                            control_space,
+                            rec_root_rot_np if control_space == "relative" else None,
+                        )
                         control_metrics = metric.calculate_control_error_metrics(
                             gen_global_joints,
                             control_hint.detach().cpu().numpy(),
@@ -1569,6 +1619,9 @@ class CustomTrainer(BaseTrainer):
             f"densities: {list(_control_cfg_value(self.cfg, 'densities', CONTROL_DENSITIES))}"
         )
         logger.info(
+            f"space: {str(_control_cfg_value(self.cfg, 'space', 'absolute')).strip().lower()}"
+        )
+        logger.info(
             f"iters_early: {int(_control_cfg_value(self.cfg, 'iters_early', 5))}"
         )
         logger.info(
@@ -1594,7 +1647,7 @@ class CustomTrainer(BaseTrainer):
             for setting_idx, setting in enumerate(self.control_eval_settings):
                 logger.info(
                     "Control eval setting: "
-                    f"{setting['name']} joints={list(setting['joints'])}"
+                    f"{setting['name']} joints={list(setting['joints'])} space={setting.get('space', 'absolute')}"
                 )
                 rng = np.random.default_rng(seed + setting_idx)
                 results = self._common_test_inference(

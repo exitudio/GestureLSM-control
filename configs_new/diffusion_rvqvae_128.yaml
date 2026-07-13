@@ -143,6 +143,7 @@ control_eval:
     - [right_wrist]
     - [head, left_wrist, right_wrist]
   densities: [1, 2, 5, 50, 100, -1]
+  space: absolute
   threshold_m: 0.5
   seed: 42
   iters_early: 5

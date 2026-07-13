@@ -450,27 +450,51 @@ function startViewer(genRaw, gtRaw, audioFile, controlRaw=[]) {
   const span = Math.max(mxX-mnX, mxY-mnY, mxZ-mnZ);
 
   const sortedControls = controls.slice().sort((a, b) => (a.joint - b.joint) || (a.frame - b.frame));
+  const groupedControls = [];
+  for (const c of sortedControls) {
+    const group = groupedControls[groupedControls.length - 1];
+    if (!group || group.joint !== c.joint) groupedControls.push({ joint: c.joint, controls: [c] });
+    else group.controls.push(c);
+  }
+  for (const group of groupedControls) {
+    const cs = group.controls;
+    group.isDense = cs.length >= 12 && cs.every((c, i) => i === 0 || c.frame === cs[i - 1].frame + 1);
+    group.firstFrame = cs[0]?.frame ?? 0;
+    group.lastFrame = cs[cs.length - 1]?.frame ?? -1;
+  }
   const controlsAtFrame = (idx) => {
     const pts = [];
     const colors = [];
     const sizes = [];
-    for (let i = 0; i < sortedControls.length; i++) {
-      const c = sortedControls[i];
-      let prevFrame = -1;
-      for (let j = i - 1; j >= 0; j--) {
-        if (sortedControls[j].joint === c.joint) {
-          prevFrame = sortedControls[j].frame;
-          break;
+    for (const group of groupedControls) {
+      if (group.isDense) {
+        const fadeFrames = Math.max(1, Math.round(FPS));
+        for (const c of group.controls) {
+          const startFrame = Math.max(0, c.frame - fadeFrames);
+          if (idx < startFrame || idx > c.frame) continue;
+          const progress = Math.max(0, Math.min(1, (idx - startFrame) / Math.max(1, c.frame - startFrame)));
+          const isCurrent = c.frame === idx;
+          const opacity = 0.12 + 0.88 * progress;
+          pts.push(c.point);
+          colors.push(`rgba(255,0,255,${opacity.toFixed(3)})`);
+          sizes.push(isCurrent ? 10 : 3 + 5 * progress);
         }
+        continue;
       }
-      const startFrame = Math.max(0, prevFrame + 1);
-      if (idx < startFrame || idx > c.frame) continue;
-      const span = Math.max(1, c.frame - startFrame);
-      const progress = Math.max(0, Math.min(1, (idx - startFrame) / span));
-      const opacity = 0.12 + 0.88 * progress;
-      pts.push(c.point);
-      colors.push(`rgba(255,0,255,${opacity.toFixed(3)})`);
-      sizes.push(5 + 5 * progress);
+
+      const cs = group.controls;
+      for (let i = 0; i < cs.length; i++) {
+        const c = cs[i];
+        const prevFrame = i > 0 ? cs[i - 1].frame : -1;
+        const startFrame = Math.max(0, prevFrame + 1);
+        if (idx < startFrame || idx > c.frame) continue;
+        const span = Math.max(1, c.frame - startFrame);
+        const progress = Math.max(0, Math.min(1, (idx - startFrame) / span));
+        const opacity = 0.12 + 0.88 * progress;
+        pts.push(c.point);
+        colors.push(`rgba(255,0,255,${opacity.toFixed(3)})`);
+        sizes.push(5 + 5 * progress);
+      }
     }
     return [pts.map(p => p[0]), pts.map(p => p[1]), pts.map(p => p[2]), colors, sizes];
   };

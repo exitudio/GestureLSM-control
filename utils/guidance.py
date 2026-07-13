@@ -100,7 +100,8 @@ def latents_to_joints(
         pose_norm=True,
         use_trans=True,
         freeze_root=True,
-        trans_offset=None):
+        trans_offset=None,
+        return_root_rot=False):
     rec_upper, rec_hands, rec_lower, rec_trans = decode_latents(
         latents,
         vq_model_upper,
@@ -139,6 +140,7 @@ def latents_to_joints(
         + inverse_selection_fn(rh, joint_mask_hands, total)
     )
     aa = rec_pose.reshape(total, 55, 3)
+    root_rot = rc.axis_angle_to_matrix(aa[:, 0]).reshape(bs_l, n_l, 3, 3)
     body_betas = (
         betas[:, None, :]
         .expand(bs_l, n_l, -1)
@@ -159,7 +161,10 @@ def latents_to_joints(
         expression=torch.zeros(total, 100, device=latents.device),
         return_verts=False,
     )
-    return out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+    joints = out.joints[:, :55].reshape(bs_l, n_l, 55, 3)
+    if return_root_rot:
+        return joints, root_rot
+    return joints
 
 
 def latent_tensor_to_joints(latent, *args, **kwargs):
@@ -170,13 +175,23 @@ def latent_tensor_to_joints(latent, *args, **kwargs):
 def latent_batch_to_window_joints(latent, round_l, pose_length, pre_frames, *args, **kwargs):
     chunk_latents = latent.squeeze(2).permute(0, 2, 1)
     full_latents = stitch_chunk_latents(chunk_latents, pre_frames)
-    full_joints = latents_to_joints(full_latents, *args, **kwargs)
+    return_root_rot = bool(kwargs.get("return_root_rot", False))
+    if return_root_rot:
+        full_joints, full_root_rot = latents_to_joints(full_latents, *args, **kwargs)
+    else:
+        full_joints = latents_to_joints(full_latents, *args, **kwargs)
     windows = []
+    root_windows = []
     for i in range(chunk_latents.shape[0]):
         start = i * round_l
         end = start + pose_length
         windows.append(full_joints[:, start:end])
-    return torch.cat(windows, dim=0)
+        if return_root_rot:
+            root_windows.append(full_root_rot[:, start:end])
+    window_joints = torch.cat(windows, dim=0)
+    if return_root_rot:
+        return window_joints, torch.cat(root_windows, dim=0)
+    return window_joints
 
 
 def update_dynamic_seeds(x0, first_seed, pre_frames):

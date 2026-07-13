@@ -40,12 +40,20 @@ _my_parser.add_argument("--control_json", default=None,
                         help="Optional sparse joint control JSON for diffusion mode.")
 _my_parser.add_argument("--control_joint", "--control_joints",
                         dest="control_joints",
-                        choices=("head", "left_wrist", "right_wrist", "all", "pelvis"),
+                        choices=(
+                            "head", "left_wrist", "right_wrist", "all", "pelvis",
+                            "left_index", "right_index",
+                        ),
                         default="left_wrist",
                         help="GT joint group for automatic control when --control_json is omitted.")
+_my_parser.add_argument("--control_space", choices=("absolute", "relative"),
+                        default="absolute",
+                        help="Use absolute GT joint positions, or joint positions in the "
+                             "root/pelvis local frame, for sparse diffusion control.")
 _my_parser.add_argument("--control_density", type=int, default=-1,
                         help="Automatic GT control density: 1/2/5 random frames, "
-                             "50/100 percent random frames, or -1 for chunk end.")
+                             "50/100 percent random frames, -1 for chunk end, "
+                             "or -2 for a root-relative circle.")
 _my_parser.add_argument("--control_timing", choices=("end", "chunk_end"), default=None,
                         help=argparse.SUPPRESS)
 _my_parser.add_argument("--disable_auto_control", action="store_true",
@@ -67,6 +75,8 @@ _my_parser.add_argument("--guidance_freeze_root", type=lambda v: str(v).lower() 
 _my_parser.add_argument("--no-cache", action="store_true",
                         help="Force rebuild of MFA TextGrid + dataloader LMDB cache.")
 _my_args, _rest = _my_parser.parse_known_args()
+if _my_args.control_density == -2 and _my_args.control_json is None:
+    _my_args.control_space = "relative"
 if _my_args.config is None:
     _my_args.config = (
         "configs/diffuser_rvqvae_128.yaml"
@@ -301,6 +311,34 @@ class HTMLTrainer:
             self.trans_std,
         )
 
+    @staticmethod
+    def _to_control_space(joints, root_rot=None):
+        if _my_args.control_space != "relative":
+            return joints
+        if root_rot is None:
+            raise ValueError("--control_space relative requires root rotations")
+        rel = joints - joints[..., 0:1, :]
+        return torch.matmul(
+            root_rot.transpose(-1, -2).unsqueeze(-3),
+            rel.unsqueeze(-1),
+        ).squeeze(-1)
+
+    def _apply_index_virtual_tip(self, joints):
+        info = getattr(self, "index_virtual_tip", None)
+        if info is None:
+            return joints
+
+        spec = info["spec"]
+        length = torch.as_tensor(
+            info["length"],
+            device=joints.device,
+            dtype=joints.dtype,
+        )
+        virtual_tip = index_virtual_tip_torch(joints, spec, length)
+        joints = joints.clone()
+        joints[..., spec["tip"], :] = virtual_tip
+        return joints
+
     def _latent_chunk_to_joints(self, latent, betas, freeze_root=True, trans_offset=None):
         return guidance_utils.latent_tensor_to_joints(
             latent,
@@ -378,7 +416,7 @@ class HTMLTrainer:
         )
 
     def _latent_batch_to_window_joints(self, latent, betas, freeze_root, round_l):
-        return guidance_utils.latent_batch_to_window_joints(
+        decoded = guidance_utils.latent_batch_to_window_joints(
             latent,
             round_l,
             self.args.pose_length,
@@ -404,7 +442,14 @@ class HTMLTrainer:
             pose_norm=self.args.pose_norm,
             use_trans=self.use_trans,
             freeze_root=freeze_root,
+            return_root_rot=(_my_args.control_space == "relative"),
         )
+        if _my_args.control_space == "relative":
+            joints, root_rot = decoded
+        else:
+            joints, root_rot = decoded, None
+        joints = self._apply_index_virtual_tip(joints)
+        return self._to_control_space(joints, root_rot)
 
     def _update_dynamic_seeds(self, x0, first_seed):
         return guidance_utils.update_dynamic_seeds(x0, first_seed, self.args.pre_frames)
@@ -670,7 +715,109 @@ CONTROL_JOINT_GROUPS = {
     "right_wrist": (21,),
     "all": (15, 20, 21),
     "pelvis": (0,),
+    "left_index": (27,),
+    "right_index": (42,),
 }
+CIRCLE_CONTROL_PERIOD_SECONDS = 2.0
+CIRCLE_CONTROL_START_FRAME = 300
+CIRCLE_CONTROL_END_FRAME = 400
+CIRCLE_CONTROL_RADIUS_SCALE = 2.0
+CIRCLE_CONTROL_HEIGHT_OFFSET = 0.10
+
+
+INDEX_STRAIGHTEN_JOINTS = {
+    "left_index": {
+        "joints": (25, 26, 27),
+        "wrist": 20,
+        "base": 25,
+        "tip": 27,
+        "mean_attr": "left_hand_mean",
+        "offset": 25,
+    },
+    "right_index": {
+        "joints": (40, 41, 42),
+        "wrist": 21,
+        "base": 40,
+        "tip": 42,
+        "mean_attr": "right_hand_mean",
+        "offset": 40,
+    },
+}
+
+
+def straighten_control_index_pose(rec_pose_aa, control_joints, smplx_model):
+    spec = INDEX_STRAIGHTEN_JOINTS.get(control_joints)
+    if spec is None:
+        return rec_pose_aa
+
+    pose = rec_pose_aa.reshape(-1, 55, 3).clone()
+    hand_mean = getattr(smplx_model, spec["mean_attr"], None)
+    if hand_mean is None:
+        logger.warning(f"SMPL-X model has no {spec['mean_attr']}; using zero index pose")
+        hand_mean = torch.zeros(45, device=pose.device, dtype=pose.dtype)
+    hand_mean = hand_mean.to(device=pose.device, dtype=pose.dtype).reshape(15, 3)
+    for joint in spec["joints"]:
+        pose[:, joint] = -hand_mean[joint - spec["offset"]]
+    logger.info(
+        f"Postprocessed {control_joints}: canceled SMPL-X hand mean for joints {list(spec['joints'])}"
+    )
+    return pose.reshape_as(rec_pose_aa)
+
+
+def calibrate_index_virtual_length(gt_joints_straight, control_joints):
+    spec = INDEX_STRAIGHTEN_JOINTS.get(control_joints)
+    if spec is None:
+        return None
+
+    length = np.linalg.norm(
+        gt_joints_straight[:, spec["tip"]] - gt_joints_straight[:, spec["base"]],
+        axis=-1,
+    )
+    length = float(np.median(length[np.isfinite(length)]))
+    length = max(length, 1e-4)
+    logger.info(
+        f"Calibrated {control_joints} virtual straight-tip length: {length:.4f}m "
+        f"(Function A, no optimization)"
+    )
+    return length
+
+
+def index_virtual_tip_np(joints, control_joints, length):
+    spec = INDEX_STRAIGHTEN_JOINTS[control_joints]
+    wrist = joints[..., spec["wrist"], :]
+    base = joints[..., spec["base"], :]
+    direction = base - wrist
+    norm = np.linalg.norm(direction, axis=-1, keepdims=True)
+    direction = direction / np.maximum(norm, 1e-6)
+    return base + direction * length
+
+
+def index_virtual_tip_torch(joints, spec, length):
+    wrist = joints[..., spec["wrist"], :]
+    base = joints[..., spec["base"], :]
+    direction = base - wrist
+    direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp_min(1e-6)
+    return base + direction * length
+
+
+def root_relative_np(points, pelvis, root_rot):
+    return np.einsum("...ji,...j->...i", root_rot, points - pelvis)
+
+
+def root_local_to_world_np(points, pelvis, root_rot):
+    return np.einsum("...ij,...j->...i", root_rot, points) + pelvis
+
+
+def control_entry_joint_position(entry, joints_frame, control_joints, index_virtual_length):
+    joint = int(entry["joint"])
+    spec = INDEX_STRAIGHTEN_JOINTS.get(control_joints)
+    if (
+        spec is not None
+        and index_virtual_length is not None
+        and joint == int(spec["tip"])
+    ):
+        return index_virtual_tip_np(joints_frame, control_joints, index_virtual_length)
+    return joints_frame[joint]
 
 
 def _control_frames_for_density(last_frame, args, density):
@@ -696,8 +843,18 @@ def _control_frames_for_density(last_frame, args, density):
     return frames.tolist()
 
 
-def build_gt_control_entries(gt_joints, max_frame, args, control_joints, control_density):
+def build_gt_control_entries(
+    gt_joints,
+    gt_root_rot,
+    max_frame,
+    args,
+    control_joints,
+    control_density,
+    control_space,
+    index_virtual_length=None,
+):
     joints = CONTROL_JOINT_GROUPS[control_joints]
+    index_spec = INDEX_STRAIGHTEN_JOINTS.get(control_joints)
     last_frame = min(max_frame, gt_joints.shape[0]) - 1
     if last_frame < 0:
         return []
@@ -705,14 +862,108 @@ def build_gt_control_entries(gt_joints, max_frame, args, control_joints, control
     frames = _control_frames_for_density(last_frame, args, int(control_density))
     entries = []
     for frame in frames:
+        pelvis = gt_joints[frame, 0]
         for joint in joints:
-            xyz = gt_joints[frame, joint].copy()
+            if (
+                index_spec is not None
+                and index_virtual_length is not None
+                and int(joint) == int(index_spec["tip"])
+            ):
+                xyz_abs = index_virtual_tip_np(
+                    gt_joints[frame],
+                    control_joints,
+                    index_virtual_length,
+                ).copy()
+            else:
+                xyz_abs = gt_joints[frame, joint].copy()
+            if control_space == "relative":
+                xyz = root_relative_np(xyz_abs, pelvis, gt_root_rot[frame])
+            else:
+                xyz = xyz_abs
             entries.append({
                 "frame": int(frame),
                 "joint": int(joint),
                 "xyz": xyz.tolist(),
+                "xyz_abs": xyz_abs.tolist(),
+                "space": control_space,
+                "index_virtual_tip": bool(index_spec is not None and int(joint) == int(index_spec["tip"])),
             })
     return entries
+
+
+def _circle_radius_for_joint(joint, median_distance):
+    if joint == 15:
+        return float(np.clip(median_distance * 0.10, 0.04, 0.06))
+    return float(np.clip(median_distance * 0.33, 0.08, 0.12))
+
+
+def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, control_joints):
+    joints = CONTROL_JOINT_GROUPS[control_joints]
+    if 0 in joints:
+        raise ValueError("--control_density -2 cannot control pelvis: the circle is root-relative")
+
+    last_frame = min(max_frame, gt_joints.shape[0]) - 1
+    if last_frame < 0:
+        return []
+    start_frame = max(0, CIRCLE_CONTROL_START_FRAME)
+    end_frame = min(last_frame, CIRCLE_CONTROL_END_FRAME)
+    if end_frame < start_frame:
+        raise ValueError(
+            f"Circle control frame range is empty: start={start_frame}, end={end_frame}, last={last_frame}"
+        )
+
+    frames = list(range(start_frame, end_frame + 1))
+    pelvis = gt_joints[: last_frame + 1, 0]
+    root_local_joints = root_relative_np(
+        gt_joints[: last_frame + 1],
+        pelvis[:, None, :],
+        gt_root_rot[: last_frame + 1, None, :, :],
+    )
+    fps = float(getattr(args, "pose_fps", 30) or 30)
+    period_frames = max(1, int(round(CIRCLE_CONTROL_PERIOD_SECONDS * fps)))
+    entries = []
+    for joint in joints:
+        rel = root_local_joints[:, joint]
+        median_rel = np.median(rel, axis=0)
+        median_distance = float(np.median(np.linalg.norm(rel, axis=1)))
+        radius = _circle_radius_for_joint(joint, median_distance) * CIRCLE_CONTROL_RADIUS_SCALE
+        front_distance = max(0.28, min(0.45, median_distance * 0.75))
+        center = np.array([
+            0.0,
+            median_rel[1] + CIRCLE_CONTROL_HEIGHT_OFFSET,
+            front_distance,
+        ])
+        speed = 2 * np.pi * radius / CIRCLE_CONTROL_PERIOD_SECONDS
+        logger.info(
+            f"Circle control joint={joint}: frames={start_frame}-{end_frame} "
+            f"center={center.round(3).tolist()} radius={radius:.3f}m "
+            f"period={CIRCLE_CONTROL_PERIOD_SECONDS:.2f}s speed={speed:.3f}m/s"
+        )
+        for frame in frames:
+            theta = 2 * np.pi * (frame % period_frames) / period_frames
+            xyz = center.copy()
+            xyz[0] = center[0] + radius * np.cos(theta)
+            xyz[1] = center[1] + radius * np.sin(theta)
+            entries.append({
+                "frame": int(frame),
+                "joint": int(joint),
+                "xyz": xyz.tolist(),
+                "space": "relative",
+                "circle": True,
+            })
+    return entries
+
+
+def _control_entry_display_point(entry, gen_joints, gen_root_rot):
+    control_space = entry.get("space", _my_args.control_space)
+    if control_space == "relative":
+        frame = int(entry["frame"])
+        target_offset = np.asarray(entry.get("final_xyz", entry["xyz"]), dtype=np.float32)
+        return root_local_to_world_np(target_offset, gen_joints[frame, 0], gen_root_rot[frame])
+    return np.asarray(
+        entry.get("final_xyz_abs", entry.get("final_xyz", entry.get("xyz_abs", entry["xyz"]))),
+        dtype=np.float32,
+    )
 
 
 @logger.catch
@@ -723,6 +974,10 @@ def main():
     control_entries = load_control_entries(_my_args.control_json)
     if control_entries and cfg.model.g_name != "GestureDiffusion":
         raise ValueError("--control_json requires --mode diffusion or a GestureDiffusion config")
+    if _my_args.control_space == "relative" and any(
+        int(entry["joint"]) == 0 for entry in control_entries
+    ):
+        raise ValueError("--control_space relative cannot control pelvis: pelvis-to-pelvis offset is always zero")
 
     out_dir = os.path.abspath(_my_args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -750,45 +1005,121 @@ def main():
     gt_trans = torch.from_numpy(gt["trans"]).float().to(DEVICE)
     gt_betas = torch.from_numpy(gt["betas"]).float().to(DEVICE)
     gt_joints = smplx_to_joints(trainer.smplx, gt_pose_aa, gt_trans, gt_betas)
+    gt_root_rot = (
+        rc.axis_angle_to_matrix(gt_pose_aa.reshape(-1, 55, 3)[:, 0])
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    gt_pose_straight_aa = straighten_control_index_pose(
+        gt_pose_aa.reshape(-1, 165),
+        _my_args.control_joints,
+        trainer.smplx,
+    )
+    gt_joints_straight = smplx_to_joints(
+        trainer.smplx,
+        gt_pose_straight_aa,
+        gt_trans,
+        gt_betas,
+    )
+    index_virtual_length = calibrate_index_virtual_length(
+        gt_joints_straight,
+        _my_args.control_joints,
+    )
+    trainer.index_virtual_tip = None
+    if index_virtual_length is not None:
+        trainer.index_virtual_tip = {
+            "spec": INDEX_STRAIGHTEN_JOINTS[_my_args.control_joints],
+            "length": index_virtual_length,
+        }
+
+    if _my_args.control_space == "relative" and _my_args.control_joints == "pelvis":
+        raise ValueError("--control_space relative cannot control pelvis: pelvis-to-pelvis offset is always zero")
 
     if not control_entries and not _my_args.disable_auto_control:
         generated_len = expected_generated_frames(gt_joints.shape[0], args)
         control_density = _my_args.control_density
-        if _my_args.control_timing is not None:
+        if control_density != -2 and _my_args.control_timing is not None:
             control_density = -1 if _my_args.control_timing == "chunk_end" else 1
-        control_entries = build_gt_control_entries(
-            gt_joints,
-            generated_len,
-            args,
-            _my_args.control_joints,
-            control_density,
-        )
-        density_name = "chunk_end" if int(control_density) == -1 else str(control_density)
-        logger.info(
-            f"Using sparse GT {_my_args.control_joints} control points "
-            f"(density_{density_name}): {len(control_entries)} keyframes"
-        )
+        if int(control_density) == -2:
+            control_entries = build_circle_control_entries(
+                gt_joints,
+                gt_root_rot,
+                generated_len,
+                args,
+                _my_args.control_joints,
+            )
+            logger.info(
+                f"Using root-relative circle {_my_args.control_joints} control points: "
+                f"{len(control_entries)} keyframes"
+            )
+        else:
+            control_entries = build_gt_control_entries(
+                gt_joints,
+                gt_root_rot,
+                generated_len,
+                args,
+                _my_args.control_joints,
+                control_density,
+                _my_args.control_space,
+                index_virtual_length,
+            )
+            density_name = "chunk_end" if int(control_density) == -1 else str(control_density)
+            logger.info(
+                f"Using sparse GT {_my_args.control_joints} {_my_args.control_space} control points "
+                f"(density_{density_name}): {len(control_entries)} keyframes"
+            )
     trainer.control_entries = control_entries if _my_args.mode == "diffusion" else []
 
     # ---- Generation ----
     out = trainer.run_inference()
     rec_pose_aa = out["rec_pose_aa"].reshape(-1, 165)
+    rec_pose_aa = straighten_control_index_pose(rec_pose_aa, _my_args.control_joints, trainer.smplx)
     rec_trans = out["rec_trans"].reshape(-1, 3)
     betas = out["tar_beta"][0, 0]
     gen_joints = smplx_to_joints(trainer.smplx, rec_pose_aa, rec_trans, betas)
+    gen_root_rot = (
+        rc.axis_angle_to_matrix(rec_pose_aa.reshape(-1, 55, 3)[:, 0])
+        .detach()
+        .cpu()
+        .numpy()
+    )
 
+    fps = int(args.pose_fps)
+    control_error_values = []
+    circle_log_stride = max(1, fps)
     for entry in control_entries:
         frame = int(entry["frame"])
         joint = int(entry["joint"])
         if 0 <= frame < gen_joints.shape[0] and 0 <= joint < gen_joints.shape[1]:
-            target = np.asarray(entry["xyz"], dtype=np.float32)
-            err = np.linalg.norm(gen_joints[frame, joint] - target)
-            logger.info(
-                f"Final control error frame={frame} joint={joint}: {err:.6f} "
-                f"gen={gen_joints[frame, joint].tolist()} target={target.tolist()}"
+            target = np.asarray(entry.get("final_xyz", entry["xyz"]), dtype=np.float32)
+            control_space = entry.get("space", _my_args.control_space)
+            gen_joint = control_entry_joint_position(
+                entry,
+                gen_joints[frame],
+                _my_args.control_joints,
+                index_virtual_length,
             )
+            if control_space == "relative":
+                gen_value = root_relative_np(gen_joint, gen_joints[frame, 0], gen_root_rot[frame])
+            else:
+                gen_value = gen_joint
+            err = np.linalg.norm(gen_value - target)
+            control_error_values.append(err)
+            if not entry.get("circle") or frame % circle_log_stride == 0:
+                logger.info(
+                    f"Final {control_space} control error frame={frame} joint={joint}: {err:.6f} "
+                    f"gen={gen_value.tolist()} target={target.tolist()}"
+                )
+    if control_error_values:
+        control_error_values = np.asarray(control_error_values, dtype=np.float32)
+        logger.info(
+            "Final control error summary: "
+            f"mean={control_error_values.mean():.6f} "
+            f"p90={np.percentile(control_error_values, 90):.6f} "
+            f"max={control_error_values.max():.6f}"
+        )
 
-    fps = int(args.pose_fps)
 
     # ---- Write canonical generation (rotations + translation + betas) ----
     np.savez(
@@ -820,7 +1151,10 @@ def main():
             os.path.join(out_dir, "control_position.npz"),
             frames=np.array([int(entry["frame"]) for entry in valid_controls], dtype=np.int32),
             joints=np.array([int(entry["joint"]) for entry in valid_controls], dtype=np.int32),
-            points=np.array([entry["xyz"] for entry in valid_controls], dtype=np.float32),
+            points=np.array([
+                _control_entry_display_point(entry, gen_joints, gen_root_rot)
+                for entry in valid_controls
+            ], dtype=np.float32),
             fps=np.int32(fps),
         )
 
