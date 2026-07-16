@@ -62,8 +62,12 @@ _my_parser.add_argument("--guidance_iters_early", type=int, default=5)
 _my_parser.add_argument("--guidance_iters_late", type=int, default=30)
 _my_parser.add_argument("--guidance_late_start", type=int, default=300,
                         help="Diffusion timestep threshold for late guidance iterations.")
+_my_parser.add_argument("--guidance_post_iters", type=int, default=0,
+                        help="Final latent optimization steps after all diffusion steps complete.")
 _my_parser.add_argument("--guidance_scale_base", type=float, default=20.0)
 _my_parser.add_argument("--guidance_weight", type=float, default=1.0)
+_my_parser.add_argument("--guidance_active_norm", choices=("linear", "sqrt", "none"), default="sqrt",
+                        help="Normalize guidance learning rate by active control count: linear, sqrt, or none.")
 _my_parser.add_argument("--guidance_chunk_delay", type=int, default=0,
                         help="Delay chunk k by k*N DDIM waves during batched guided diffusion. "
                              "Use 0 for the all-chunks-at-once schedule.")
@@ -570,8 +574,10 @@ class HTMLTrainer:
                         "iters_early": _my_args.guidance_iters_early,
                         "iters_late": _my_args.guidance_iters_late,
                         "late_start": _my_args.guidance_late_start,
+                        "post_iters": _my_args.guidance_post_iters,
                         "scale": _my_args.guidance_scale_base,
                         "weight": _my_args.guidance_weight,
+                        "active_norm": _my_args.guidance_active_norm,
                         "chunk_delay": _my_args.guidance_chunk_delay,
                         "log_every": _my_args.guidance_log_every,
                         "freeze_root": _my_args.guidance_freeze_root,

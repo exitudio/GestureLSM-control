@@ -138,19 +138,23 @@ control_eval:
   enabled: False
   name: ""
   joints:
-    - [head]
     - [left_wrist]
     - [right_wrist]
-    - [head, left_wrist, right_wrist]
-  densities: [1, 2, 5, 50, 100, -1]
+    - [left_elbow]
+    - [right_elbow]
+    - [left_wrist, right_wrist, left_elbow, right_elbow]
+  densities: [1, 5, 100]
+  max_samples: 15
   space: absolute
-  threshold_m: 0.5
+  threshold_m: 0.05
   seed: 42
   iters_early: 5
   iters_late: 30
   late_start: 300
+  post_iters: 0
   scale: 1.0
   weight: 1.0
+  active_norm: sqrt
   log_every: 0
   freeze_root: True
 

@@ -58,16 +58,20 @@ GT_SKATING_METRIC_NAMES = tuple(f"gt_{name}" for name in SKATING_METRIC_NAMES)
 
 CONTROL_JOINT_GROUPS = {
     "head": (15,),
+    "left_elbow": (18,),
+    "right_elbow": (19,),
     "left_wrist": (20,),
     "right_wrist": (21,),
-    "all": (15, 20, 21),
+    "all": (20, 21, 18, 19),
 }
 CONTROL_JOINT_NAMES = {
     15: "head",
+    18: "left_elbow",
+    19: "right_elbow",
     20: "left_wrist",
     21: "right_wrist",
 }
-CONTROL_DENSITIES = (1, 2, 5, 50, 100)
+CONTROL_DENSITIES = (1, 2, 5)
 CONTROL_METRIC_NAMES = (
     "fgd",
     "gt_fgd",
@@ -76,8 +80,8 @@ CONTROL_METRIC_NAMES = (
     "l1div",
     "gt_l1div",
     "foot_skating_ratio",
-    "traj_err_50cm",
-    "loc_err_50cm",
+    "traj_err_5cm",
+    "loc_err_5cm",
     "avg_err_cm",
 )
 
@@ -117,7 +121,9 @@ def _normalize_control_joint_group(group):
         return group, CONTROL_JOINT_GROUPS[group]
 
     names = [str(name).strip().strip("'\"") for name in group]
-    if names == ["head", "left_wrist", "right_wrist"]:
+    if names in (["left_wrist", "right_wrist", "left_elbow", "right_elbow"], ["head", "left_wrist", "right_wrist"]):
+        if names == ["head", "left_wrist", "right_wrist"]:
+            return "head_left_wrist_right_wrist", (15, 20, 21)
         return "all", CONTROL_JOINT_GROUPS["all"]
     joints = []
     for name in names:
@@ -131,34 +137,40 @@ def _control_eval_settings_from_cfg(cfg):
     groups = _parse_control_joint_groups(_control_cfg_value(
         cfg,
         "joints",
-        (("head",), ("left_wrist",), ("right_wrist",), ("head", "left_wrist", "right_wrist")),
+        (
+            ("left_wrist",),
+            ("right_wrist",),
+            ("left_elbow",),
+            ("right_elbow",),
+            ("left_wrist", "right_wrist", "left_elbow", "right_elbow"),
+        ),
     ))
     densities = _control_cfg_value(cfg, "densities", CONTROL_DENSITIES)
     space = str(_control_cfg_value(cfg, "space", "absolute")).strip().lower()
     if space not in ("absolute", "relative"):
         raise ValueError(f"Unknown control_eval.space: {space}")
+    normalized_groups = [_normalize_control_joint_group(group) for group in groups]
+    single_groups = [item for item in normalized_groups if len(item[1]) == 1]
+    multi_groups = [item for item in normalized_groups if len(item[1]) != 1]
+
     settings = []
-    for group in groups:
-        group_name, joints = _normalize_control_joint_group(group)
+    for group_list in (single_groups, multi_groups):
         for density in densities:
             density = int(density)
             density_name = "chunk_end" if density == -1 else str(density)
-            settings.append({
-                "name": f"{group_name}/density_{density_name}",
-                "joint_group": group_name,
-                "joints": joints,
-                "density": density,
-                "space": space,
-            })
+            for group_name, joints in group_list:
+                settings.append({
+                    "name": f"{group_name}/density_{density_name}",
+                    "joint_group": group_name,
+                    "joints": joints,
+                    "density": density,
+                    "space": space,
+                })
     return settings
 
 
 def _control_eval_metric_names(settings):
-    return [
-        f"control/{setting['name']}/{metric_name}"
-        for setting in settings
-        for metric_name in CONTROL_METRIC_NAMES
-    ]
+    return [f"control/aggregate/{metric_name}" for metric_name in CONTROL_METRIC_NAMES]
 
 
 class CustomTrainer(BaseTrainer):
@@ -467,7 +479,7 @@ class CustomTrainer(BaseTrainer):
         return bool(control_cfg is not None and getattr(control_cfg, "enabled", False))
 
     def _control_eval_threshold_m(self):
-        return float(_control_cfg_value(self.cfg, "threshold_m", 0.5))
+        return float(_control_cfg_value(self.cfg, "threshold_m", 0.05))
 
     def _axis_angle_to_smplx_joints(self, pose_aa, trans, beta, exps=None):
         bs, n = pose_aa.shape[:2]
@@ -592,24 +604,33 @@ class CustomTrainer(BaseTrainer):
         hint = torch.zeros_like(target_joints)
         mask = torch.zeros(bs, n, 55, device=target_joints.device, dtype=target_joints.dtype)
         density = int(setting["density"])
+        seed_frames = self.cfg.pre_frames * self.cfg.vqvae_squeeze_scale
+        round_l = self.cfg.data.pose_length - seed_frames
         if density == -1:
-            seed_frames = self.cfg.pre_frames * self.cfg.vqvae_squeeze_scale
-            round_l = self.cfg.data.pose_length - seed_frames
             frames = list(range(self.cfg.data.pose_length - 1, n, round_l))
             if not frames or frames[-1] != n - 1:
                 frames.append(n - 1)
-            frames = np.asarray(frames, dtype=np.int64)
+            frames_by_batch = [np.asarray(frames, dtype=np.int64) for _ in range(bs)]
         else:
-            if density in (1, 2, 5):
-                frame_count = min(n, density)
-            else:
-                frame_count = min(n, int(n * density / 100))
-            if frame_count <= 0:
-                return None
-        for b in range(bs):
-            if density != -1:
-                frames = np.asarray(rng.choice(n, frame_count, replace=False), dtype=np.int64)
-                frames.sort()
+            frames_by_batch = []
+            for b in range(bs):
+                selected = []
+                for start in range(0, n, round_l):
+                    chunk_start = start if start == 0 else start + seed_frames
+                    chunk_end = min(start + self.cfg.data.pose_length, n)
+                    if chunk_start >= chunk_end:
+                        continue
+                    eligible = np.arange(chunk_start, chunk_end, dtype=np.int64)
+                    if density in (1, 2, 5):
+                        frame_count = min(len(eligible), density)
+                    else:
+                        frame_count = min(len(eligible), int(len(eligible) * density / 100))
+                    if frame_count > 0:
+                        selected.extend(rng.choice(eligible, frame_count, replace=False).tolist())
+                if not selected:
+                    return None
+                frames_by_batch.append(np.asarray(sorted(set(selected)), dtype=np.int64))
+        for b, frames in enumerate(frames_by_batch):
             for joint in setting["joints"]:
                 hint[b, frames, joint] = target_joints[b, frames, joint]
                 mask[b, frames, joint] = 1.0
@@ -743,8 +764,10 @@ class CustomTrainer(BaseTrainer):
                     "iters_early": int(_control_cfg_value(self.cfg, "iters_early", 5)),
                     "iters_late": int(_control_cfg_value(self.cfg, "iters_late", 30)),
                     "late_start": int(_control_cfg_value(self.cfg, "late_start", 300)),
+                    "post_iters": int(_control_cfg_value(self.cfg, "post_iters", 0)),
                     "scale": float(_control_cfg_value(self.cfg, "scale", 20.0)),
                     "weight": float(_control_cfg_value(self.cfg, "weight", 1.0)),
+                    "active_norm": str(_control_cfg_value(self.cfg, "active_norm", "sqrt")),
                     "log_every": int(_control_cfg_value(self.cfg, "log_every", 0)),
                     "freeze_root": bool(_control_cfg_value(self.cfg, "freeze_root", True)),
                 }
@@ -950,6 +973,9 @@ class CustomTrainer(BaseTrainer):
         save_results=False,
         control_setting=None,
         control_rng=None,
+        control_settings=None,
+        control_seed=None,
+        only_iteration=None,
     ):
         """
         Common inference logic shared by val, test, test_clip, and test_render methods.
@@ -1008,14 +1034,38 @@ class CustomTrainer(BaseTrainer):
                 )
 
             for its, batch_data in iterator:
-                if max_iterations is not None and its > max_iterations:
+                if only_iteration is not None:
+                    if its < only_iteration:
+                        continue
+                    if its > only_iteration:
+                        break
+                elif max_iterations is not None and its >= max_iterations:
                     break
+
+                sample_control_setting = control_setting
+                sample_control_rng = control_rng
+                if control_settings is not None:
+                    if its >= len(control_settings):
+                        break
+                    sample_control_setting = control_settings[its]
+                    sample_control_rng = np.random.default_rng(int(control_seed or 0) + its)
+                    seq_id = None
+                    if its < len(test_seq_list):
+                        seq_id = test_seq_list.iloc[its].get("id", None)
+                    seq_info = f" sample_id={seq_id}" if seq_id is not None else ""
+                    logger.info(
+                        "Control eval sample: "
+                        f"sample_index={its}{seq_info} setting={sample_control_setting['name']} "
+                        f"joints={list(sample_control_setting['joints'])} "
+                        f"density={sample_control_setting['density']} "
+                        f"space={sample_control_setting.get('space', 'absolute')}"
+                    )
 
                 loaded_data = self._load_data(batch_data)
                 net_out = self._g_test(
                     loaded_data,
-                    control_setting=control_setting,
-                    control_rng=control_rng,
+                    control_setting=sample_control_setting,
+                    control_rng=sample_control_rng,
                 )
 
                 tar_pose = net_out["tar_pose"]
@@ -1168,16 +1218,20 @@ class CustomTrainer(BaseTrainer):
                             control_hint.detach().cpu().numpy(),
                             control_mask.detach().cpu().numpy(),
                             threshold_m=self._control_eval_threshold_m(),
+                            chunk_length=self.cfg.data.pose_length,
+                            chunk_step=self.cfg.data.pose_length
+                            - self.cfg.pre_frames * self.cfg.vqvae_squeeze_scale,
+                            chunk_seed_frames=self.cfg.pre_frames * self.cfg.vqvae_squeeze_scale,
                         )
-                        active_samples = int(control_metrics["active_samples"])
+                        active_chunks = int(control_metrics["active_chunks"])
                         active_points = int(control_metrics["active_points"])
-                        if active_samples > 0:
-                            control_metric_sums["traj_err_50cm"] += (
-                                control_metrics["traj_err_50cm"] * active_samples
+                        if active_chunks > 0:
+                            control_metric_sums["traj_err_5cm"] += (
+                                control_metrics["traj_err_5cm"] * active_chunks
                             )
-                            control_metric_counts["traj_err_50cm"] += active_samples
+                            control_metric_counts["traj_err_5cm"] += active_chunks
                         if active_points > 0:
-                            for metric_name in ("loc_err_50cm", "avg_err_cm"):
+                            for metric_name in ("loc_err_5cm", "avg_err_cm"):
                                 control_metric_sums[metric_name] += (
                                     control_metrics[metric_name] * active_points
                                 )
@@ -1390,7 +1444,7 @@ class CustomTrainer(BaseTrainer):
             if control_metric_counts[name] > 0 else 0.0
             for name in CONTROL_METRIC_NAMES
         }
-        control_metrics_avg["active_samples"] = control_metric_counts["traj_err_50cm"]
+        control_metrics_avg["active_chunks"] = control_metric_counts["traj_err_5cm"]
 
         return {
             "total_length": total_length,
@@ -1583,9 +1637,15 @@ class CustomTrainer(BaseTrainer):
             raise ValueError("control_eval.enabled=True requires GestureDiffusion")
 
         seed = int(_control_cfg_value(self.cfg, "seed", 42))
-        max_iterations = None
+        max_samples = int(_control_cfg_value(self.cfg, "max_samples", 15))
+        eval_settings = list(self.control_eval_settings)
+        if max_samples > 0:
+            eval_settings = eval_settings[:max_samples]
+        available_samples = len(self.test_data.selected_file)
+        if available_samples > 0:
+            eval_settings = eval_settings[:available_samples]
         if getattr(self.cfg, "debug", False):
-            max_iterations = 0
+            eval_settings = eval_settings[:1]
 
         control_log_sink = None
         if self.rank == 0:
@@ -1606,7 +1666,7 @@ class CustomTrainer(BaseTrainer):
 
         group_summaries = []
         seen_groups = set()
-        for setting in self.control_eval_settings:
+        for setting in eval_settings:
             group_name = setting["joint_group"]
             if group_name in seen_groups:
                 continue
@@ -1616,8 +1676,11 @@ class CustomTrainer(BaseTrainer):
         logger.info("Control eval configuration:")
         logger.info(f"joint combinations: {group_summaries}")
         logger.info(
-            f"densities: {list(_control_cfg_value(self.cfg, 'densities', CONTROL_DENSITIES))}"
+            f"densities: {list(_control_cfg_value(self.cfg, 'densities', CONTROL_DENSITIES))} per chunk"
         )
+        logger.info(f"control settings: {len(self.control_eval_settings)}")
+        logger.info(f"available samples: {available_samples}")
+        logger.info(f"max_samples total: {len(eval_settings)}")
         logger.info(
             f"space: {str(_control_cfg_value(self.cfg, 'space', 'absolute')).strip().lower()}"
         )
@@ -1631,10 +1694,16 @@ class CustomTrainer(BaseTrainer):
             f"late_start: {int(_control_cfg_value(self.cfg, 'late_start', 300))}"
         )
         logger.info(
+            f"post_iters: {int(_control_cfg_value(self.cfg, 'post_iters', 0))}"
+        )
+        logger.info(
             f"scale: {float(_control_cfg_value(self.cfg, 'scale', 20.0))}"
         )
         logger.info(
             f"weight: {float(_control_cfg_value(self.cfg, 'weight', 1.0))}"
+        )
+        logger.info(
+            f"active_norm: {str(_control_cfg_value(self.cfg, 'active_norm', 'sqrt'))}"
         )
         logger.info(
             f"freeze_root: {bool(_control_cfg_value(self.cfg, 'freeze_root', True))}"
@@ -1644,50 +1713,44 @@ class CustomTrainer(BaseTrainer):
         )
 
         try:
-            for setting_idx, setting in enumerate(self.control_eval_settings):
-                logger.info(
-                    "Control eval setting: "
-                    f"{setting['name']} joints={list(setting['joints'])} space={setting.get('space', 'absolute')}"
-                )
-                rng = np.random.default_rng(seed + setting_idx)
-                results = self._common_test_inference(
-                    self.test_loader,
-                    epoch,
-                    mode="control_eval",
-                    max_iterations=max_iterations,
-                    control_setting=setting,
-                    control_rng=rng,
-                )
-                control_metrics = results["control_metrics"]
-                total_length = results["total_length"]
-                num_sequences = results["num_sequences"]
-                latent_out_all = np.concatenate(results["latent_out"], axis=0)
-                latent_ori_all = np.concatenate(results["latent_ori"], axis=0)
-                fgd = data_tools.FIDCalculator.frechet_distance(
-                    latent_out_all, latent_ori_all
-                )
-                gt_fgd = data_tools.FIDCalculator.frechet_distance(
-                    latent_ori_all, latent_ori_all
-                )
-                align_denom = total_length - 2 * num_sequences * self.align_mask
-                align_avg = results["align"] / align_denom
-                gt_align_avg = results["align_gt"] / align_denom
-                metric_values = {
-                    "fgd": fgd,
-                    "gt_fgd": gt_fgd,
-                    "align": align_avg,
-                    "gt_align": gt_align_avg,
-                    "l1div": self.l1_calculator.avg(),
-                    "gt_l1div": results["gt_l1div"],
-                    "foot_skating_ratio": results["skating_metrics"]["skating_ratio"],
-                    "traj_err_50cm": control_metrics["traj_err_50cm"],
-                    "loc_err_50cm": control_metrics["loc_err_50cm"],
-                    "avg_err_cm": control_metrics["avg_err_cm"],
-                }
-                for metric_name, value in metric_values.items():
-                    tracker_name = f"control/{setting['name']}/{metric_name}"
-                    logger.info(f"{tracker_name}: {value}")
-                    self.test_recording(tracker_name, value, epoch)
+            results = self._common_test_inference(
+                self.test_loader,
+                epoch,
+                mode="control_eval",
+                max_iterations=len(eval_settings),
+                control_settings=eval_settings,
+                control_seed=seed,
+            )
+            control_metrics = results["control_metrics"]
+            total_length = results["total_length"]
+            num_sequences = results["num_sequences"]
+            latent_out_all = np.concatenate(results["latent_out"], axis=0)
+            latent_ori_all = np.concatenate(results["latent_ori"], axis=0)
+            fgd = data_tools.FIDCalculator.frechet_distance(
+                latent_out_all, latent_ori_all
+            )
+            gt_fgd = data_tools.FIDCalculator.frechet_distance(
+                latent_ori_all, latent_ori_all
+            )
+            align_denom = total_length - 2 * num_sequences * self.align_mask
+            align_avg = results["align"] / align_denom
+            gt_align_avg = results["align_gt"] / align_denom
+            metric_values = {
+                "fgd": fgd,
+                "gt_fgd": gt_fgd,
+                "align": align_avg,
+                "gt_align": gt_align_avg,
+                "l1div": self.l1_calculator.avg(),
+                "gt_l1div": results["gt_l1div"],
+                "foot_skating_ratio": results["skating_metrics"]["skating_ratio"],
+                "traj_err_5cm": control_metrics["traj_err_5cm"],
+                "loc_err_5cm": control_metrics["loc_err_5cm"],
+                "avg_err_cm": control_metrics["avg_err_cm"],
+            }
+            for metric_name, value in metric_values.items():
+                tracker_name = f"control/aggregate/{metric_name}"
+                logger.info(f"{tracker_name}: {value}")
+                self.test_recording(tracker_name, value, epoch)
         finally:
             if control_log_sink is not None:
                 logger.remove(control_log_sink)

@@ -187,7 +187,16 @@ class GestureDiffusion(torch.nn.Module):
             return x0
 
         active = torch.clamp((mask > 0).sum().to(dtype=x0.dtype), min=1.0)
-        lr = float(control.get("scale", 20.0)) / active.item()
+        active_norm = str(control.get("active_norm", "linear")).strip().lower()
+        if active_norm == "linear":
+            norm = active.item()
+        elif active_norm == "sqrt":
+            norm = active.sqrt().item()
+        elif active_norm in ("none", "off"):
+            norm = 1.0
+        else:
+            raise ValueError(f"Unknown guidance active_norm: {active_norm}")
+        lr = float(control.get("scale", 20.0)) / max(norm, 1.0)
         weight = float(control.get("weight", 1.0))
         log_every = int(control.get("log_every", 0))
         loss_stop = float(control.get("loss_stop", 5e-7))
@@ -210,7 +219,7 @@ class GestureDiffusion(torch.nn.Module):
                     t_log = t.detach().cpu().tolist() if t.dim() > 0 else int(t.item())
                     print(
                         f"[guidance]{context} t={t_log} opt={opt_i + 1}/{n_iters} "
-                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f}"
+                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f} active_norm={active_norm}"
                     )
                 if loss_value <= loss_stop:
                     break
@@ -326,6 +335,23 @@ class GestureDiffusion(torch.nn.Module):
                 seed = seed_update_fn(x0_for_seed.detach(), seed).detach()
 
             latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
+
+        post_iters = int(control.get("post_iters", 0)) if control is not None else 0
+        if post_iters > 0 and guidance_fn is not None:
+            post_control = dict(control)
+            post_control["iters_early"] = post_iters
+            post_control["iters_late"] = post_iters
+            post_control["late_start"] = 0
+            post_control["log_context"] = (
+                f"post_diffusion chunks={list(range(latents.shape[0]))}"
+            )
+            post_t = timesteps.new_zeros(())
+            latents = self._spatial_guidance_step(
+                latents,
+                post_t,
+                guidance_fn,
+                post_control,
+            )
 
         return_dict['latents'] = latents
         return return_dict
