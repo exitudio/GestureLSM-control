@@ -169,6 +169,35 @@ class GestureDiffusion(torch.nn.Module):
         ])
         return extract_into_tensor(posterior_variance, timesteps, sample.shape)
 
+    @staticmethod
+    def _guidance_iteration_counts(t, control, batch_size: int, device) -> torch.Tensor:
+        override = control.get("n_iters")
+        if override is not None:
+            counts = torch.as_tensor(override, device=device, dtype=torch.long)
+            if counts.dim() == 0:
+                counts = counts.expand(batch_size)
+            return counts.reshape(-1)[:batch_size].clamp_min(0)
+
+        if not torch.is_tensor(t):
+            t_tensor = torch.as_tensor(t, device=device)
+        else:
+            t_tensor = t.to(device=device)
+        if t_tensor.dim() == 0:
+            t_tensor = t_tensor.expand(batch_size)
+        t_tensor = t_tensor.reshape(-1)[:batch_size].to(dtype=torch.float32)
+
+        late_start = int(control.get("late_start", 300))
+        iters_early = int(control.get("iters_early", 5))
+        iters_late = int(control.get("iters_late", 30))
+        if late_start <= 0:
+            progress = (t_tensor <= late_start).to(dtype=torch.float32)
+        else:
+            progress = ((late_start - t_tensor) / float(late_start)).clamp(0.0, 1.0)
+        counts = torch.round(
+            iters_early + (iters_late - iters_early) * progress
+        ).to(dtype=torch.long)
+        return counts.clamp_min(0)
+
     def _spatial_guidance_step(self, x0, t, guidance_fn, control):
         hint = control["hint"].to(device=x0.device, dtype=x0.dtype)
         mask = control["mask"].to(device=x0.device, dtype=x0.dtype)
@@ -180,9 +209,10 @@ class GestureDiffusion(torch.nn.Module):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
-        late_start = int(control.get("late_start", 300))
-        t_for_schedule = t.min() if t.dim() > 0 else t
-        n_iters = int(control.get("iters_late", 30) if int(t_for_schedule.item()) <= late_start else control.get("iters_early", 5))
+        n_iters_by_sample = self._guidance_iteration_counts(
+            t, control, x0.shape[0], x0.device
+        )
+        n_iters = int(n_iters_by_sample.max().item())
         if n_iters <= 0:
             return x0
 
@@ -205,9 +235,17 @@ class GestureDiffusion(torch.nn.Module):
             x = x0.detach().clone().requires_grad_(True)
             optimizer = torch.optim.Adam([x], lr=lr)
             for opt_i in range(n_iters):
+                iter_active = (n_iters_by_sample > opt_i).to(dtype=x0.dtype)
+                if iter_active.sum() <= 0:
+                    continue
                 optimizer.zero_grad(set_to_none=True)
-                joints = guidance_fn(x, bool(control.get("freeze_root", True)))
-                frame_mask = mask.unsqueeze(-1)
+                guidance_kwargs = control.get("guidance_kwargs", {})
+                joints = guidance_fn(
+                    x,
+                    bool(control.get("freeze_root", True)),
+                    **guidance_kwargs,
+                )
+                frame_mask = mask.unsqueeze(-1) * iter_active.view(-1, 1, 1, 1)
                 diff = (joints - hint) * frame_mask
                 loss = 0.5 * diff.pow(2).sum() * weight
                 loss.backward()
@@ -216,14 +254,213 @@ class GestureDiffusion(torch.nn.Module):
                 loss_value = loss.detach().item()
                 if log_every > 0 and (opt_i == 0 or opt_i == n_iters - 1 or (opt_i + 1) % log_every == 0):
                     context = f" {log_context}" if log_context else ""
-                    t_log = t.detach().cpu().tolist() if t.dim() > 0 else int(t.item())
+                    if torch.is_tensor(t):
+                        t_log = t.detach().cpu().tolist() if t.dim() > 0 else int(t.item())
+                    else:
+                        t_log = int(t)
                     print(
                         f"[guidance]{context} t={t_log} opt={opt_i + 1}/{n_iters} "
-                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f} active_norm={active_norm}"
+                        f"loss={loss_value:.6f} grad={grad_norm:.6f} lr={lr:.6f} active_norm={active_norm} "
+                        f"n_iters={n_iters_by_sample.detach().cpu().tolist()}"
                     )
                 if loss_value <= loss_stop:
                     break
         return x.detach()
+
+    @staticmethod
+    def _slice_control(control, indices):
+        sliced = dict(control)
+        for key in ("hint", "mask"):
+            if key in sliced:
+                sliced[key] = sliced[key].index_select(0, indices)
+        return sliced
+
+    def _diffusion_reverse_delayed(
+            self,
+            latents: torch.Tensor,
+            seed: torch.Tensor,
+            at_feat: torch.Tensor,
+            timesteps: torch.Tensor,
+            noise: torch.Tensor,
+            guidance_scale: float,
+            control: dict,
+            guidance_fn,
+            seed_update_fn,
+            extra_step_kwargs: dict,
+            chunk_delay: int,
+    ) -> torch.Tensor:
+        num_steps = len(timesteps)
+        num_chunks = latents.shape[0]
+        post_iters = int(control.get("post_iters", 0)) if control is not None else 0
+        post_wave_steps = post_iters if guidance_fn is not None else 0
+        total_waves = num_steps + post_wave_steps + (num_chunks - 1) * chunk_delay
+
+        latents = torch.zeros_like(latents)
+        latents = self.scheduler.add_noise(latents, noise, timesteps[0])
+        x0_estimate = latents.detach().clone()
+
+        logger.info(
+            "[delay] enabled chunks=%s ddim_steps=%s chunk_delay=%s post_waves=%s total_waves=%s",
+            num_chunks, num_steps, chunk_delay, post_wave_steps, total_waves,
+        )
+
+        first_chunk_timing = {
+            "first_chunk_seconds": 0.0,
+            "first_chunk_waves": num_steps + post_wave_steps,
+            "first_chunk_diffusion_steps": num_steps,
+            "first_chunk_post_steps": post_wave_steps,
+        }
+        first_chunk_start_time = None
+        first_chunk_end_local = num_steps + post_wave_steps - 1
+
+        chunk_ids = torch.arange(num_chunks, device=latents.device)
+        for wave_i in range(total_waves):
+            if wave_i == 0:
+                if latents.is_cuda:
+                    torch.cuda.synchronize(latents.device)
+                first_chunk_start_time = time.perf_counter()
+            local_steps = wave_i - chunk_ids * chunk_delay
+            diffusion_mask = (local_steps >= 0) & (local_steps < num_steps)
+            post_mask = (local_steps >= num_steps) & (local_steps < num_steps + post_wave_steps)
+            active_mask = diffusion_mask | post_mask
+            if not active_mask.any():
+                continue
+
+            diffusion_indices = diffusion_mask.nonzero(as_tuple=False).flatten()
+            active_indices = active_mask.nonzero(as_tuple=False).flatten()
+            active_t = timesteps.new_zeros((active_indices.shape[0],))
+            candidate_x0 = latents.index_select(0, active_indices)
+
+            model_output = None
+            active_latents = None
+            active_steps = None
+            guided_x0 = None
+
+            if diffusion_indices.numel() > 0:
+                active_steps = local_steps.index_select(0, diffusion_indices).long()
+                diffusion_t = timesteps.index_select(0, active_steps)
+
+                if seed_update_fn is not None:
+                    updated_seed = seed_update_fn(x0_estimate.detach(), seed).detach()
+                    seed = seed.clone()
+                    seed[diffusion_indices] = updated_seed[diffusion_indices]
+
+                active_latents = latents.index_select(0, diffusion_indices)
+                active_input = torch.cat([
+                    self.scheduler.scale_model_input(
+                        active_latents[local_i:local_i + 1],
+                        diffusion_t[local_i],
+                    )
+                    for local_i in range(active_latents.shape[0])
+                ], dim=0)
+                model_output = self.apply_classifier_free_guidance(
+                    x=active_input,
+                    timesteps=diffusion_t,
+                    seed=seed.index_select(0, diffusion_indices),
+                    at_feat=at_feat.index_select(0, diffusion_indices),
+                    guidance_scale=guidance_scale,
+                )
+
+                latents_pred_x0, _ = self.predicted_origin(
+                    model_output, diffusion_t, active_latents
+                )
+                diffusion_pos = torch.searchsorted(active_indices, diffusion_indices)
+                candidate_x0 = candidate_x0.clone()
+                candidate_x0[diffusion_pos] = latents_pred_x0
+                active_t[diffusion_pos] = diffusion_t
+
+            if guidance_fn is not None:
+                step_control = self._slice_control(control, active_indices)
+                n_iters_by_active = torch.zeros(
+                    active_indices.shape[0], device=latents.device, dtype=torch.long
+                )
+                if diffusion_indices.numel() > 0:
+                    diffusion_pos = torch.searchsorted(active_indices, diffusion_indices)
+                    n_iters_by_active[diffusion_pos] = self._guidance_iteration_counts(
+                        active_t.index_select(0, diffusion_pos),
+                        control,
+                        diffusion_pos.shape[0],
+                        latents.device,
+                    )
+                if post_wave_steps > 0:
+                    post_indices = post_mask.nonzero(as_tuple=False).flatten()
+                    if post_indices.numel() > 0:
+                        post_pos = torch.searchsorted(active_indices, post_indices)
+                        n_iters_by_active[post_pos] = 1
+                step_control["n_iters"] = n_iters_by_active
+                step_control["log_context"] = (
+                    f"wave={wave_i:02d} chunks={active_indices.detach().cpu().tolist()} "
+                    f"local={local_steps.index_select(0, active_indices).detach().cpu().tolist()}"
+                )
+                x0_context = x0_estimate.clone()
+                x0_context[active_indices] = candidate_x0.detach()
+                step_control["guidance_kwargs"] = {
+                    "full_x0": x0_context,
+                    "chunk_indices": active_indices,
+                }
+                guided_x0 = self._spatial_guidance_step(
+                    candidate_x0,
+                    active_t,
+                    guidance_fn,
+                    step_control,
+                )
+            else:
+                guided_x0 = candidate_x0
+
+            latents = latents.clone()
+            x0_estimate = x0_estimate.clone()
+
+            if diffusion_indices.numel() > 0:
+                diffusion_pos = torch.searchsorted(active_indices, diffusion_indices)
+                guided_diffusion_x0 = guided_x0.index_select(0, diffusion_pos)
+                diffusion_t = active_t.index_select(0, diffusion_pos)
+                if guidance_fn is not None:
+                    model_output = self.model_output_from_origin(
+                        guided_diffusion_x0, diffusion_t, active_latents
+                    )
+                next_latents = []
+                for local_i in range(diffusion_indices.shape[0]):
+                    next_latents.append(
+                        self.scheduler.step(
+                            model_output[local_i:local_i + 1],
+                            diffusion_t[local_i],
+                            active_latents[local_i:local_i + 1],
+                            **extra_step_kwargs,
+                        ).prev_sample
+                    )
+                next_latents = torch.cat(next_latents, dim=0)
+                latents[diffusion_indices] = next_latents
+                x0_estimate[diffusion_indices] = guided_diffusion_x0.detach()
+
+                finished_mask = active_steps == (num_steps - 1)
+                if finished_mask.any():
+                    finished_indices = diffusion_indices.index_select(
+                        0, finished_mask.nonzero(as_tuple=False).flatten()
+                    )
+                    finished_latents = next_latents.index_select(
+                        0, finished_mask.nonzero(as_tuple=False).flatten()
+                    )
+                    x0_estimate[finished_indices] = finished_latents.detach()
+
+            if post_wave_steps > 0:
+                post_indices = post_mask.nonzero(as_tuple=False).flatten()
+                if post_indices.numel() > 0:
+                    post_pos = torch.searchsorted(active_indices, post_indices)
+                    guided_post = guided_x0.index_select(0, post_pos)
+                    latents[post_indices] = guided_post
+                    x0_estimate[post_indices] = guided_post.detach()
+
+            if (
+                    first_chunk_start_time is not None
+                    and first_chunk_timing["first_chunk_seconds"] <= 0.0
+                    and int(local_steps[0].item()) == first_chunk_end_local
+            ):
+                if latents.is_cuda:
+                    torch.cuda.synchronize(latents.device)
+                first_chunk_timing["first_chunk_seconds"] = time.perf_counter() - first_chunk_start_time
+
+        return latents, first_chunk_timing
+
 
 
 
@@ -279,14 +516,6 @@ class GestureDiffusion(torch.nn.Module):
         timesteps = self.scheduler.timesteps.to(at_feat.device)
         num_steps = len(timesteps)
         chunk_delay = max(0, int(control.get("chunk_delay", 0))) if control is not None else 0
-        if chunk_delay > 0:
-            logger.warning(
-                "Ignoring chunk_delay=%s; delayed wave scheduling is disabled.",
-                chunk_delay,
-            )
-
-        latents = torch.zeros_like(latents)
-        latents = self.scheduler.add_noise(latents, noise, timesteps[0])
 
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, and between [0, 1]
@@ -295,53 +524,73 @@ class GestureDiffusion(torch.nn.Module):
                 inspect.signature(self.scheduler.step).parameters.keys()):
             extra_step_kwargs["eta"] = self.cfg.model.scheduler.eta
 
-        logger.info(
-            "[delay] disabled chunks=%s ddim_steps=%s",
-            latents.shape[0], num_steps,
-        )
-        for wave_i, t in enumerate(timesteps):
-            latent_model_input = latents
-            # actually it does nothing here according to ddim scheduler
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+        delayed_timing = {}
+        if chunk_delay > 0:
+            latents, delayed_timing = self._diffusion_reverse_delayed(
+                latents,
+                seed,
+                at_feat,
+                timesteps,
+                noise,
+                guidance_scale,
+                control,
+                guidance_fn,
+                seed_update_fn,
+                extra_step_kwargs,
+                chunk_delay,
+            )
+        else:
+            latents = torch.zeros_like(latents)
+            latents = self.scheduler.add_noise(latents, noise, timesteps[0])
 
-            # predict the noise residual
-            model_output = self.apply_classifier_free_guidance(
-                x=latent_model_input,
-                timesteps=t,
-                seed=seed,
-                at_feat=at_feat,
-                guidance_scale=guidance_scale)
+            logger.info(
+                "[delay] disabled chunks=%s ddim_steps=%s",
+                latents.shape[0], num_steps,
+            )
+            for wave_i, t in enumerate(timesteps):
+                latent_model_input = latents
+                # actually it does nothing here according to ddim scheduler
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            t_batch = None
-            x0_for_seed = None
-            if control is not None and guidance_fn is not None:
-                t_batch = t.expand(latents.shape[0])
-                latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
-                step_control = dict(control)
-                step_control["log_context"] = (
-                    f"wave={wave_i:02d} chunks={list(range(latents.shape[0]))}"
-                )
-                guided_x0 = self._spatial_guidance_step(
-                    latents_pred_x0, t, guidance_fn, step_control
-                )
-                model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
-                x0_for_seed = guided_x0
+                # predict the noise residual
+                model_output = self.apply_classifier_free_guidance(
+                    x=latent_model_input,
+                    timesteps=t,
+                    seed=seed,
+                    at_feat=at_feat,
+                    guidance_scale=guidance_scale)
 
-            if seed_update_fn is not None:
-                if x0_for_seed is None:
-                    if t_batch is None:
-                        t_batch = t.expand(latents.shape[0])
-                    x0_for_seed, _ = self.predicted_origin(model_output, t_batch, latents)
-                seed = seed_update_fn(x0_for_seed.detach(), seed).detach()
+                t_batch = None
+                x0_for_seed = None
+                if control is not None and guidance_fn is not None:
+                    t_batch = t.expand(latents.shape[0])
+                    latents_pred_x0, _ = self.predicted_origin(model_output, t_batch, latents)
+                    step_control = dict(control)
+                    step_control["log_context"] = (
+                        f"wave={wave_i:02d} chunks={list(range(latents.shape[0]))}"
+                    )
+                    guided_x0 = self._spatial_guidance_step(
+                        latents_pred_x0, t, guidance_fn, step_control
+                    )
+                    model_output = self.model_output_from_origin(guided_x0, t_batch, latents)
+                    x0_for_seed = guided_x0
 
-            latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
+                if seed_update_fn is not None:
+                    if x0_for_seed is None:
+                        if t_batch is None:
+                            t_batch = t.expand(latents.shape[0])
+                        x0_for_seed, _ = self.predicted_origin(model_output, t_batch, latents)
+                    seed = seed_update_fn(x0_for_seed.detach(), seed).detach()
+
+                latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
 
         post_iters = int(control.get("post_iters", 0)) if control is not None else 0
-        if post_iters > 0 and guidance_fn is not None:
+        if chunk_delay == 0 and post_iters > 0 and guidance_fn is not None:
             post_control = dict(control)
             post_control["iters_early"] = post_iters
             post_control["iters_late"] = post_iters
             post_control["late_start"] = 0
+            post_control.pop("guidance_kwargs", None)
             post_control["log_context"] = (
                 f"post_diffusion chunks={list(range(latents.shape[0]))}"
             )
@@ -354,6 +603,10 @@ class GestureDiffusion(torch.nn.Module):
             )
 
         return_dict['latents'] = latents
+        return_dict['timing'] = {
+            key: torch.as_tensor(value, device=latents.device)
+            for key, value in delayed_timing.items()
+        }
         return return_dict
 
     def _diffusion_process(self,

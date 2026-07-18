@@ -155,6 +155,7 @@ control_eval:
   scale: 1.0
   weight: 1.0
   active_norm: sqrt
+  chunk_delay: 0
   log_every: 0
   freeze_root: True
 

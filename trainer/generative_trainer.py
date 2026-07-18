@@ -590,6 +590,32 @@ class CustomTrainer(BaseTrainer):
             joints, root_rot = decoded, None
         return self._to_control_space(joints, control_space, root_rot)
 
+    def _latent_delayed_window_joints(
+            self,
+            latent,
+            betas,
+            freeze_root,
+            round_l,
+            control_space="absolute",
+            full_x0=None,
+            chunk_indices=None):
+        if full_x0 is None or chunk_indices is None:
+            return self._latent_batch_to_window_joints(
+                latent, betas, freeze_root, round_l, control_space
+            )
+
+        if torch.is_tensor(chunk_indices):
+            indices = [int(i) for i in chunk_indices.detach().cpu().tolist()]
+        else:
+            indices = [int(i) for i in chunk_indices]
+
+        full_context = full_x0.clone()
+        full_context[indices] = latent
+        all_windows = self._latent_batch_to_window_joints(
+            full_context, betas, freeze_root, round_l, control_space
+        )
+        return all_windows[indices]
+
     def _update_dynamic_seeds(self, x0, first_seed):
         return guidance_utils.update_dynamic_seeds(x0, first_seed, self.cfg.pre_frames)
 
@@ -768,13 +794,16 @@ class CustomTrainer(BaseTrainer):
                     "scale": float(_control_cfg_value(self.cfg, "scale", 20.0)),
                     "weight": float(_control_cfg_value(self.cfg, "weight", 1.0)),
                     "active_norm": str(_control_cfg_value(self.cfg, "active_norm", "sqrt")),
+                    "chunk_delay": int(_control_cfg_value(self.cfg, "chunk_delay", 0)),
                     "log_every": int(_control_cfg_value(self.cfg, "log_every", 0)),
                     "freeze_root": bool(_control_cfg_value(self.cfg, "freeze_root", True)),
                 }
                 control_space = control_full.get("space", "absolute")
                 cond_["y"]["guidance_fn"] = (
-                    lambda x, freeze_root=True, betas=tar_beta[:, 0], round_l=round_l, control_space=control_space:
-                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l, control_space)
+                    lambda x, freeze_root=True, betas=tar_beta[:, 0], round_l=round_l, control_space=control_space, **kwargs:
+                    self._latent_delayed_window_joints(
+                        x, betas, freeze_root, round_l, control_space, **kwargs
+                    )
                 )
                 cond_["y"]["seed_update_fn"] = (
                     lambda x, seed, first_seed=first_seed:
@@ -1685,6 +1714,9 @@ class CustomTrainer(BaseTrainer):
             f"space: {str(_control_cfg_value(self.cfg, 'space', 'absolute')).strip().lower()}"
         )
         logger.info(
+            f"chunk_delay: {int(_control_cfg_value(self.cfg, 'chunk_delay', 0))}"
+        )
+        logger.info(
             f"iters_early: {int(_control_cfg_value(self.cfg, 'iters_early', 5))}"
         )
         logger.info(
@@ -1713,6 +1745,7 @@ class CustomTrainer(BaseTrainer):
         )
 
         try:
+            generation_start_time = time.time()
             results = self._common_test_inference(
                 self.test_loader,
                 epoch,
@@ -1721,9 +1754,14 @@ class CustomTrainer(BaseTrainer):
                 control_settings=eval_settings,
                 control_seed=seed,
             )
+            generation_time = time.time() - generation_start_time
             control_metrics = results["control_metrics"]
             total_length = results["total_length"]
             num_sequences = results["num_sequences"]
+            logger.info(
+                f"total generation time: {int(generation_time)} s "
+                f"for {int(total_length / self.cfg.data.pose_fps)} s motion"
+            )
             latent_out_all = np.concatenate(results["latent_out"], axis=0)
             latent_ori_all = np.concatenate(results["latent_ori"], axis=0)
             fgd = data_tools.FIDCalculator.frechet_distance(

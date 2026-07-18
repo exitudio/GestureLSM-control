@@ -103,6 +103,7 @@ import hashlib
 
 import shutil
 import subprocess
+import time
 import warnings
 
 import librosa
@@ -455,6 +456,29 @@ class HTMLTrainer:
         joints = self._apply_index_virtual_tip(joints)
         return self._to_control_space(joints, root_rot)
 
+    def _latent_delayed_window_joints(
+            self,
+            latent,
+            betas,
+            freeze_root,
+            round_l,
+            full_x0=None,
+            chunk_indices=None):
+        if full_x0 is None or chunk_indices is None:
+            return self._latent_batch_to_window_joints(latent, betas, freeze_root, round_l)
+
+        if torch.is_tensor(chunk_indices):
+            indices = [int(i) for i in chunk_indices.detach().cpu().tolist()]
+        else:
+            indices = [int(i) for i in chunk_indices]
+
+        full_context = full_x0.clone()
+        full_context[indices] = latent
+        all_windows = self._latent_batch_to_window_joints(
+            full_context, betas, freeze_root, round_l
+        )
+        return all_windows[indices]
+
     def _update_dynamic_seeds(self, x0, first_seed):
         return guidance_utils.update_dynamic_seeds(x0, first_seed, self.args.pre_frames)
 
@@ -535,6 +559,24 @@ class HTMLTrainer:
         audio_chunks, word_chunks, id_chunks = [], [], []
         seed_chunks = []
         first_seed = in_seed[:, :a.pre_frames]
+        model_forward_seconds = 0.0
+        model_forward_calls = 0
+        first_chunk_seconds = 0.0
+        first_chunk_waves = 0
+        first_chunk_diffusion_steps = 0
+        first_chunk_post_steps = 0
+
+        def timed_model_forward(cond):
+            nonlocal model_forward_seconds, model_forward_calls
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            model_out = self.model(cond)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model_forward_seconds += time.perf_counter() - start_time
+            model_forward_calls += 1
+            return model_out
 
         for i in range(roundt):
             audio_chunks.append(
@@ -584,8 +626,10 @@ class HTMLTrainer:
                     },
                 }}
                 cond["y"]["guidance_fn"] = (
-                    lambda x, freeze_root=True, betas=betas, round_l=round_l:
-                    self._latent_batch_to_window_joints(x, betas, freeze_root, round_l)
+                    lambda x, freeze_root=True, betas=betas, round_l=round_l, **kwargs:
+                    self._latent_delayed_window_joints(
+                        x, betas, freeze_root, round_l, **kwargs
+                    )
                 )
                 cond["y"]["seed_update_fn"] = (
                     lambda x, seed, first_seed=first_seed:
@@ -596,7 +640,20 @@ class HTMLTrainer:
                     f"{roundt} chunks, {int((mask_batch > 0).sum().item())} keyframes, "
                     f"chunk_delay={_my_args.guidance_chunk_delay}"
                 )
-                final_chunks = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
+                model_out = timed_model_forward(cond)
+                timing = model_out.get("timing", {})
+
+                def timing_value(key, default=0.0):
+                    value = timing.get(key, default)
+                    if torch.is_tensor(value):
+                        return value.detach().float().mean().item()
+                    return value
+
+                first_chunk_seconds = float(timing_value("first_chunk_seconds", 0.0))
+                first_chunk_waves = int(timing_value("first_chunk_waves", 0))
+                first_chunk_diffusion_steps = int(timing_value("first_chunk_diffusion_steps", 0))
+                first_chunk_post_steps = int(timing_value("first_chunk_post_steps", 0))
+                final_chunks = model_out["latents"].squeeze(2).permute(0, 2, 1)
 
         if final_chunks is None:
             rec_chunks = []
@@ -612,7 +669,7 @@ class HTMLTrainer:
                     "mask": (torch.zeros([bs, 1, 1, a.pose_length], device=self.mean_upper.device) < 1),
                     "style_feature": torch.zeros([bs, 512], device=self.mean_upper.device),
                 }}
-                sample = self.model(cond)["latents"].squeeze(2).permute(0, 2, 1)
+                sample = timed_model_forward(cond)["latents"].squeeze(2).permute(0, 2, 1)
                 last_sample = sample.clone()
                 rec_chunks.append(sample)
             final_chunks = torch.cat(rec_chunks, dim=0)
@@ -645,6 +702,12 @@ class HTMLTrainer:
             "rec_pose_aa": rec_pose.reshape(bs_l, n_l, 165),
             "rec_trans": rec_trans,
             "tar_beta": loaded_data["tar_beta"][:, :n_l],
+            "model_forward_seconds": model_forward_seconds,
+            "model_forward_calls": model_forward_calls,
+            "first_chunk_seconds": first_chunk_seconds,
+            "first_chunk_waves": first_chunk_waves,
+            "first_chunk_diffusion_steps": first_chunk_diffusion_steps,
+            "first_chunk_post_steps": first_chunk_post_steps,
         }
 
     @torch.no_grad()
@@ -1079,6 +1142,29 @@ def main():
 
     # ---- Generation ----
     out = trainer.run_inference()
+    model_forward_seconds = float(out.get("model_forward_seconds", 0.0))
+    model_forward_calls = int(out.get("model_forward_calls", 0))
+    generated_frames = int(out["rec_pose_aa"].shape[1])
+    generated_seconds = generated_frames / float(args.pose_fps)
+    if model_forward_calls > 0:
+        logger.info(
+            "Model-only speed: "
+            f"{model_forward_seconds:.3f}s over {model_forward_calls} forward call(s), "
+            f"motion={generated_seconds:.3f}s, "
+            f"rtf={model_forward_seconds / max(generated_seconds, 1e-9):.3f}"
+        )
+    first_chunk_seconds = float(out.get("first_chunk_seconds", 0.0))
+    if first_chunk_seconds > 0.0:
+        first_chunk_waves = int(out.get("first_chunk_waves", 0))
+        first_chunk_motion_seconds = float(args.pose_length) / float(args.pose_fps)
+        logger.info(
+            "First-chunk model speed: "
+            f"{first_chunk_seconds:.3f}s over {first_chunk_waves} wave(s), "
+            f"diffusion_steps={int(out.get('first_chunk_diffusion_steps', 0))}, "
+            f"post_steps={int(out.get('first_chunk_post_steps', 0))}, "
+            f"chunk_motion={first_chunk_motion_seconds:.3f}s, "
+            f"rtf={first_chunk_seconds / max(first_chunk_motion_seconds, 1e-9):.3f}"
+        )
     rec_pose_aa = out["rec_pose_aa"].reshape(-1, 165)
     rec_pose_aa = straighten_control_index_pose(rec_pose_aa, _my_args.control_joints, trainer.smplx)
     rec_trans = out["rec_trans"].reshape(-1, 3)
