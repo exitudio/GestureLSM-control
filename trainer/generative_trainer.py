@@ -72,6 +72,13 @@ CONTROL_JOINT_NAMES = {
     21: "right_wrist",
 }
 CONTROL_DENSITIES = (1, 2, 5)
+CONTROL_ERROR_THRESHOLDS_CM = (5, 10, 20, 50)
+CONTROL_TRAJ_METRIC_NAMES = tuple(
+    f"traj_err_{threshold_cm}cm" for threshold_cm in CONTROL_ERROR_THRESHOLDS_CM
+)
+CONTROL_LOC_METRIC_NAMES = tuple(
+    f"loc_err_{threshold_cm}cm" for threshold_cm in CONTROL_ERROR_THRESHOLDS_CM
+)
 CONTROL_METRIC_NAMES = (
     "fgd",
     "gt_fgd",
@@ -80,8 +87,8 @@ CONTROL_METRIC_NAMES = (
     "l1div",
     "gt_l1div",
     "foot_skating_ratio",
-    "traj_err_5cm",
-    "loc_err_5cm",
+    *CONTROL_TRAJ_METRIC_NAMES,
+    *CONTROL_LOC_METRIC_NAMES,
     "avg_err_cm",
 )
 
@@ -1255,12 +1262,13 @@ class CustomTrainer(BaseTrainer):
                         active_chunks = int(control_metrics["active_chunks"])
                         active_points = int(control_metrics["active_points"])
                         if active_chunks > 0:
-                            control_metric_sums["traj_err_5cm"] += (
-                                control_metrics["traj_err_5cm"] * active_chunks
-                            )
-                            control_metric_counts["traj_err_5cm"] += active_chunks
+                            for metric_name in CONTROL_TRAJ_METRIC_NAMES:
+                                control_metric_sums[metric_name] += (
+                                    control_metrics[metric_name] * active_chunks
+                                )
+                                control_metric_counts[metric_name] += active_chunks
                         if active_points > 0:
-                            for metric_name in ("loc_err_5cm", "avg_err_cm"):
+                            for metric_name in (*CONTROL_LOC_METRIC_NAMES, "avg_err_cm"):
                                 control_metric_sums[metric_name] += (
                                     control_metrics[metric_name] * active_points
                                 )
@@ -1473,7 +1481,7 @@ class CustomTrainer(BaseTrainer):
             if control_metric_counts[name] > 0 else 0.0
             for name in CONTROL_METRIC_NAMES
         }
-        control_metrics_avg["active_chunks"] = control_metric_counts["traj_err_5cm"]
+        control_metrics_avg["active_chunks"] = control_metric_counts[CONTROL_TRAJ_METRIC_NAMES[0]]
 
         return {
             "total_length": total_length,
@@ -1781,8 +1789,8 @@ class CustomTrainer(BaseTrainer):
                 "l1div": self.l1_calculator.avg(),
                 "gt_l1div": results["gt_l1div"],
                 "foot_skating_ratio": results["skating_metrics"]["skating_ratio"],
-                "traj_err_5cm": control_metrics["traj_err_5cm"],
-                "loc_err_5cm": control_metrics["loc_err_5cm"],
+                **{name: control_metrics[name] for name in CONTROL_TRAJ_METRIC_NAMES},
+                **{name: control_metrics[name] for name in CONTROL_LOC_METRIC_NAMES},
                 "avg_err_cm": control_metrics["avg_err_cm"],
             }
             for metric_name, value in metric_values.items():

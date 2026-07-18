@@ -132,3 +132,40 @@ Notes:
 - `13-08-13` used the newer code with `chunk_delay=0`, so post optimization still ran as a final post-denoise block.
 - Best control accuracy in this range by `avg_err_cm` is still `01-49-15` at `0.333379 cm`, followed by `04-29-14` at `0.458950 cm`.
 - The post-in-wave run `07-04-55` had similar `fgd` to the best delayed runs, but much worse trajectory/local control error in this run.
+
+# Control Eval Comparison: 26-07-18 02:41:08 to 05:48:54
+
+Inclusive run range:
+
+- Start: `26-07-18_02-41-08__absolute_den1-2-5_opt0-5-30_NormLinear_delay0+fullDec_StepIncrease_start100`
+- End: `26-07-18_05-48-54__absolute_den1-2-5_opt0-30-30_NormLinear_delay0+fullDec_StepIncrease_start100`
+
+Shared settings omitted from the table:
+
+- `space`: `absolute`
+- `densities`: `[1, 2, 5] per chunk`
+- `iters_early`: `0`
+- `late_start`: `100`
+- `post_iters`: `30`
+- `scale`: `1.0`
+- `weight`: `1.0`
+- `active_norm`: `linear`
+- `freeze_root`: `False`
+
+| Run | chunk_delay | iters_late | avg_err_cm | traj_5 | traj_10 | traj_20 | traj_50 | loc_5 | loc_10 | loc_20 | loc_50 | fgd | align | l1div | foot_skating | gen_time_s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `26-07-18_02-41-08__absolute_den1-2-5_opt0-5-30_NormLinear_delay0+fullDec_StepIncrease_start100` | 0 | 5 | 7.169152 | 0.625498 | N/A | N/A | N/A | 0.534951 | N/A | N/A | N/A | 0.444298 | 0.761429 | 12.089540 | 0.054155 | 758 |
+| `26-07-18_02-57-07__absolute_den1-2-5_opt0-5-30_NormLinear_delay1+fullDec_StepIncrease_start100` | 1 | 5 | 9.541210 | 0.828685 | N/A | N/A | N/A | 0.686408 | N/A | N/A | N/A | 0.439104 | 0.765565 | 11.634272 | 0.078068 | 2407 |
+| `26-07-18_02-57-43__absolute_den1-2-5_opt0-10-30_NormLinear_delay1+fullDec_StepIncrease_start100` | 1 | 10 | 8.946033 | 0.828685 | N/A | N/A | N/A | 0.660194 | N/A | N/A | N/A | 0.452479 | 0.770137 | 11.436724 | 0.078684 | 4266 |
+| `26-07-18_03-44-16__absolute_den1-2-5_opt0-5-30_NormLinear_delay1+fullDec_StepIncrease_start100` | 1 | 5 | 9.429157 | 0.832669 | 0.486056 | 0.195219 | 0.011952 | 0.691262 | 0.320388 | 0.093204 | 0.002913 | 0.440867 | 0.762931 | 11.648256 | 0.072473 | 2421 |
+| `26-07-18_04-34-19__absolute_den1-2-5_opt0-20-30_NormLinear_delay1+fullDec_StepIncrease_start100` | 1 | 20 | 7.841073 | 0.737052 | 0.342629 | 0.127490 | 0.015936 | 0.586408 | 0.231068 | 0.054369 | 0.004854 | 0.461893 | 0.777664 | 11.313787 | 0.098244 | 7949 |
+| `26-07-18_05-48-25__absolute_den1-2-5_opt0-20-30_NormLinear_delay0+fullDec_StepIncrease_start100` | 0 | 20 | 6.698243 | 0.669323 | 0.310757 | 0.043825 | 0.003984 | 0.547573 | 0.199029 | 0.021359 | 0.001942 | 0.449436 | 0.760542 | 11.962539 | 0.054501 | 1411 |
+| `26-07-18_05-48-54__absolute_den1-2-5_opt0-30-30_NormLinear_delay0+fullDec_StepIncrease_start100` | 0 | 30 | 5.651711 | 0.549801 | 0.227092 | 0.027888 | 0.000000 | 0.427184 | 0.142718 | 0.014563 | 0.000000 | 0.451415 | 0.760436 | 11.939730 | 0.057758 | 1744 |
+
+Notes:
+
+- Lower is better for `avg_err_cm`, `traj_*`, `loc_*`, `fgd`, and `foot_skating`.
+- Higher is typically better for `align` and `l1div`, depending on the target tradeoff.
+- `N/A` means the run finished before the 10/20/50cm error metrics were added to logging.
+- Best `avg_err_cm` in this group is `05-48-54` at `5.651711 cm`; best `fgd` is `02-57-07` at `0.439104`.
+- The `chunk_delay=0` runs are much faster here than delayed wave runs, but absolute control errors remain high compared with the relative-space table above.

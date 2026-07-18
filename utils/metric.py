@@ -154,33 +154,45 @@ def calculate_control_error_metrics(
     sample_active = active.reshape(active.shape[0], -1)
     valid_sample = sample_active.sum(axis=1) > 0
 
+    threshold_specs = (
+        ("5cm", 0.05),
+        ("10cm", 0.10),
+        ("20cm", 0.20),
+        ("50cm", 0.50),
+    )
+    threshold_m = float(threshold_m)
+    if not any(abs(threshold_m - value) < 1e-8 for _, value in threshold_specs):
+        threshold_specs = ((f"{int(round(threshold_m * 100))}cm", threshold_m),) + threshold_specs
+
     total_active = active.sum()
     if total_active <= 0:
-        return {
-            "traj_err_5cm": 0.0,
-            "loc_err_5cm": 0.0,
+        empty_metrics = {
             "avg_err_cm": 0.0,
             "active_points": 0,
             "active_samples": 0,
             "active_chunks": 0,
         }
+        for suffix, _ in threshold_specs:
+            empty_metrics[f"traj_err_{suffix}"] = 0.0
+            empty_metrics[f"loc_err_{suffix}"] = 0.0
+        return empty_metrics
 
+    active_chunks = 0
+    chunk_error_masks = []
     if chunk_length is None or chunk_step is None:
         error_flat = errors.reshape(errors.shape[0], -1)
-        traj_fail = np.zeros((motions.shape[0],), dtype=np.float32)
-        traj_fail[valid_sample] = (
-            (error_flat[valid_sample] > threshold_m) & sample_active[valid_sample]
-        ).any(axis=1).astype(np.float32)
-        traj_err = float(traj_fail[valid_sample].mean()) if valid_sample.any() else 0.0
-        active_chunks = int(valid_sample.sum())
+        active_flat = sample_active
+        for b in range(motions.shape[0]):
+            if not valid_sample[b]:
+                continue
+            active_chunks += 1
+            chunk_error_masks.append((error_flat[b], active_flat[b]))
     else:
         chunk_length = int(chunk_length)
         chunk_step = int(chunk_step)
         chunk_seed_frames = int(chunk_seed_frames)
         if chunk_length <= 0 or chunk_step <= 0:
             raise ValueError("chunk_length and chunk_step must be positive")
-        fail_chunks = 0
-        active_chunks = 0
         for b in range(motions.shape[0]):
             for start in range(0, motions.shape[1], chunk_step):
                 active_start = start if start == 0 else start + chunk_seed_frames
@@ -191,21 +203,24 @@ def calculate_control_error_metrics(
                 if not chunk_active.any():
                     continue
                 active_chunks += 1
-                chunk_errors = errors[b, active_start:active_end]
-                if ((chunk_errors > threshold_m) & chunk_active).any():
-                    fail_chunks += 1
-        traj_err = float(fail_chunks / active_chunks) if active_chunks > 0 else 0.0
+                chunk_error_masks.append((errors[b, active_start:active_end], chunk_active))
 
-    loc_fail = ((errors > threshold_m) & active).sum() / total_active
-    avg_err_cm = errors[active].mean() * 100.0
-    return {
-        "traj_err_5cm": traj_err,
-        "loc_err_5cm": float(loc_fail),
-        "avg_err_cm": float(avg_err_cm),
+    metrics = {
+        "avg_err_cm": float(errors[active].mean() * 100.0),
         "active_points": int(total_active),
         "active_samples": int(valid_sample.sum()),
         "active_chunks": int(active_chunks),
     }
+    for suffix, threshold in threshold_specs:
+        fail_chunks = sum(
+            int(((chunk_errors > threshold) & chunk_active).any())
+            for chunk_errors, chunk_active in chunk_error_masks
+        )
+        traj_err = float(fail_chunks / active_chunks) if active_chunks > 0 else 0.0
+        loc_fail = ((errors > threshold) & active).sum() / total_active
+        metrics[f"traj_err_{suffix}"] = traj_err
+        metrics[f"loc_err_{suffix}"] = float(loc_fail)
+    return metrics
 
 
 class SRGR(object):
