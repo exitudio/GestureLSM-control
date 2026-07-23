@@ -53,9 +53,11 @@ _my_parser.add_argument("--control_space", choices=("absolute", "relative"),
 _my_parser.add_argument("--control_density", type=int, default=-1,
                         help="Automatic GT control density: 1/2/5 random frames, "
                              "50/100 percent random frames, -1 for chunk end, "
-                             "or -2 for a root-relative circle.")
+                             "or -2 for a circle using --control_space.")
 _my_parser.add_argument("--control_timing", choices=("end", "chunk_end"), default=None,
                         help=argparse.SUPPRESS)
+_my_parser.add_argument("--circle_radius_multiplier", type=float, default=2.0,
+                        help="Scale -2 circle radius while keeping the bottom of the circle fixed.")
 _my_parser.add_argument("--disable_auto_control", action="store_true",
                         help="Disable automatic GT control when --control_json is omitted.")
 _my_parser.add_argument("--guidance_iters_early", type=int, default=5)
@@ -79,8 +81,6 @@ _my_parser.add_argument("--guidance_freeze_root", type=lambda v: str(v).lower() 
 _my_parser.add_argument("--no-cache", action="store_true",
                         help="Force rebuild of MFA TextGrid + dataloader LMDB cache.")
 _my_args, _rest = _my_parser.parse_known_args()
-if _my_args.control_density == -2 and _my_args.control_json is None:
-    _my_args.control_space = "relative"
 if _my_args.config is None:
     _my_args.config = (
         "configs/diffuser_rvqvae_128.yaml"
@@ -966,10 +966,10 @@ def _circle_radius_for_joint(joint, median_distance):
     return float(np.clip(median_distance * 0.33, 0.08, 0.12))
 
 
-def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, control_joints):
+def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, control_joints, control_space):
     joints = CONTROL_JOINT_GROUPS[control_joints]
-    if 0 in joints:
-        raise ValueError("--control_density -2 cannot control pelvis: the circle is root-relative")
+    if 0 in joints and control_space == "relative":
+        raise ValueError("--control_density -2 cannot control pelvis in relative space")
 
     last_frame = min(max_frame, gt_joints.shape[0]) - 1
     if last_frame < 0:
@@ -995,31 +995,47 @@ def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, contro
         rel = root_local_joints[:, joint]
         median_rel = np.median(rel, axis=0)
         median_distance = float(np.median(np.linalg.norm(rel, axis=1)))
-        radius = _circle_radius_for_joint(joint, median_distance) * CIRCLE_CONTROL_RADIUS_SCALE
+        base_radius = _circle_radius_for_joint(joint, median_distance) * CIRCLE_CONTROL_RADIUS_SCALE
+        radius_multiplier = max(0.01, float(_my_args.circle_radius_multiplier))
+        radius = base_radius * radius_multiplier
         front_distance = max(0.28, min(0.45, median_distance * 0.75))
-        center = np.array([
+        relative_center_base = np.array([
             0.0,
             median_rel[1] + CIRCLE_CONTROL_HEIGHT_OFFSET,
             front_distance,
-        ])
+        ], dtype=np.float32)
+        if control_space == "absolute":
+            center = root_local_to_world_np(
+                relative_center_base,
+                pelvis[start_frame],
+                gt_root_rot[start_frame],
+            ).astype(np.float32)
+            center[1] += radius - base_radius
+        else:
+            center = relative_center_base.copy()
+            center[1] += radius - base_radius
         speed = 2 * np.pi * radius / CIRCLE_CONTROL_PERIOD_SECONDS
         logger.info(
             f"Circle control joint={joint}: frames={start_frame}-{end_frame} "
-            f"center={center.round(3).tolist()} radius={radius:.3f}m "
-            f"period={CIRCLE_CONTROL_PERIOD_SECONDS:.2f}s speed={speed:.3f}m/s"
+            f"space={control_space} center={center.round(3).tolist()} radius={radius:.3f}m "
+            f"radius_multiplier={radius_multiplier:.2f} period={CIRCLE_CONTROL_PERIOD_SECONDS:.2f}s "
+            f"speed={speed:.3f}m/s"
         )
         for frame in frames:
-            theta = 2 * np.pi * (frame % period_frames) / period_frames
+            theta = 2 * np.pi * (frame - start_frame) / period_frames
             xyz = center.copy()
             xyz[0] = center[0] + radius * np.cos(theta)
             xyz[1] = center[1] + radius * np.sin(theta)
-            entries.append({
+            entry = {
                 "frame": int(frame),
                 "joint": int(joint),
                 "xyz": xyz.tolist(),
-                "space": "relative",
+                "space": control_space,
                 "circle": True,
-            })
+            }
+            if control_space == "absolute":
+                entry["xyz_abs"] = xyz.tolist()
+            entries.append(entry)
     return entries
 
 
@@ -1117,9 +1133,10 @@ def main():
                 generated_len,
                 args,
                 _my_args.control_joints,
+                _my_args.control_space,
             )
             logger.info(
-                f"Using root-relative circle {_my_args.control_joints} control points: "
+                f"Using {_my_args.control_space} circle {_my_args.control_joints} control points: "
                 f"{len(control_entries)} keyframes"
             )
         else:
