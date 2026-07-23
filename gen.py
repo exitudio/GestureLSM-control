@@ -53,7 +53,8 @@ _my_parser.add_argument("--control_space", choices=("absolute", "relative"),
 _my_parser.add_argument("--control_density", type=int, default=-1,
                         help="Automatic GT control density: 1/2/5 random frames, "
                              "50/100 percent random frames, -1 for chunk end, "
-                             "or -2 for a circle using --control_space.")
+                             "-2 for a circle using --control_space, "
+                             "or -3 for a 20-frame relative window from that circle.")
 _my_parser.add_argument("--control_timing", choices=("end", "chunk_end"), default=None,
                         help=argparse.SUPPRESS)
 _my_parser.add_argument("--circle_radius_multiplier", type=float, default=2.0,
@@ -792,6 +793,9 @@ CIRCLE_CONTROL_START_FRAME = 300
 CIRCLE_CONTROL_END_FRAME = 400
 CIRCLE_CONTROL_RADIUS_SCALE = 2.0
 CIRCLE_CONTROL_HEIGHT_OFFSET = 0.10
+CIRCLE_WINDOW_CENTER_FRAME = 323
+CIRCLE_WINDOW_CONTROL_FRAMES = 20
+CIRCLE_WINDOW_FORWARD_OFFSET = 0.25
 
 
 INDEX_STRAIGHTEN_JOINTS = {
@@ -966,7 +970,7 @@ def _circle_radius_for_joint(joint, median_distance):
     return float(np.clip(median_distance * 0.33, 0.08, 0.12))
 
 
-def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, control_joints, control_space):
+def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, control_joints, control_space, only_frame=None, only_frames=None, forward_offset=0.0):
     joints = CONTROL_JOINT_GROUPS[control_joints]
     if 0 in joints and control_space == "relative":
         raise ValueError("--control_density -2 cannot control pelvis in relative space")
@@ -981,7 +985,24 @@ def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, contro
             f"Circle control frame range is empty: start={start_frame}, end={end_frame}, last={last_frame}"
         )
 
-    frames = list(range(start_frame, end_frame + 1))
+    if only_frames is not None:
+        frames = [int(frame) for frame in only_frames]
+        bad_frames = [frame for frame in frames if frame < start_frame or frame > end_frame]
+        if bad_frames:
+            raise ValueError(
+                f"Circle control frames {bad_frames} are outside "
+                f"circle range {start_frame}-{end_frame}"
+            )
+    elif only_frame is not None:
+        only_frame = int(only_frame)
+        if only_frame < start_frame or only_frame > end_frame:
+            raise ValueError(
+                f"Single circle control frame {only_frame} is outside "
+                f"circle range {start_frame}-{end_frame}"
+            )
+        frames = [only_frame]
+    else:
+        frames = list(range(start_frame, end_frame + 1))
     pelvis = gt_joints[: last_frame + 1, 0]
     root_local_joints = root_relative_np(
         gt_joints[: last_frame + 1],
@@ -1014,10 +1035,12 @@ def build_circle_control_entries(gt_joints, gt_root_rot, max_frame, args, contro
         else:
             center = relative_center_base.copy()
             center[1] += radius - base_radius
+            center[2] += float(forward_offset)
         speed = 2 * np.pi * radius / CIRCLE_CONTROL_PERIOD_SECONDS
         logger.info(
-            f"Circle control joint={joint}: frames={start_frame}-{end_frame} "
+            f"Circle control joint={joint}: frames={frames[0]}-{frames[-1]} "
             f"space={control_space} center={center.round(3).tolist()} radius={radius:.3f}m "
+            f"forward_offset={float(forward_offset):.3f}m "
             f"radius_multiplier={radius_multiplier:.2f} period={CIRCLE_CONTROL_PERIOD_SECONDS:.2f}s "
             f"speed={speed:.3f}m/s"
         )
@@ -1124,7 +1147,7 @@ def main():
     if not control_entries and not _my_args.disable_auto_control:
         generated_len = expected_generated_frames(gt_joints.shape[0], args)
         control_density = _my_args.control_density
-        if control_density != -2 and _my_args.control_timing is not None:
+        if control_density not in (-2, -3) and _my_args.control_timing is not None:
             control_density = -1 if _my_args.control_timing == "chunk_end" else 1
         if int(control_density) == -2:
             control_entries = build_circle_control_entries(
@@ -1138,6 +1161,27 @@ def main():
             logger.info(
                 f"Using {_my_args.control_space} circle {_my_args.control_joints} control points: "
                 f"{len(control_entries)} keyframes"
+            )
+        elif int(control_density) == -3:
+            if _my_args.control_space != "relative":
+                raise ValueError("--control_density -3 only supports --control_space relative")
+            half_window = CIRCLE_WINDOW_CONTROL_FRAMES // 2
+            window_start = CIRCLE_WINDOW_CENTER_FRAME - half_window
+            window_frames = list(range(window_start, window_start + CIRCLE_WINDOW_CONTROL_FRAMES))
+            control_entries = build_circle_control_entries(
+                gt_joints,
+                gt_root_rot,
+                generated_len,
+                args,
+                _my_args.control_joints,
+                _my_args.control_space,
+                only_frames=window_frames,
+                forward_offset=CIRCLE_WINDOW_FORWARD_OFFSET,
+            )
+            logger.info(
+                f"Using relative {CIRCLE_WINDOW_CONTROL_FRAMES}-frame circle {_my_args.control_joints} "
+                f"control window {window_frames[0]}-{window_frames[-1]} "
+                f"forward_offset={CIRCLE_WINDOW_FORWARD_OFFSET:.3f}m: {len(control_entries)} keyframes"
             )
         else:
             control_entries = build_gt_control_entries(
